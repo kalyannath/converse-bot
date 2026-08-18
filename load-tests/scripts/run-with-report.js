@@ -40,7 +40,7 @@ if (!fs.existsSync(jsonPath)) {
   process.exit(run.status ?? 1);
 }
 
-const report = spawnSync('node', [path.join(__dirname, 'generate-report.js'), jsonPath, htmlPath], {
+const report = spawnSync('node', [path.join(__dirname, 'generate-report.js'), jsonPath, htmlPath, scriptPath], {
   stdio: 'inherit',
   shell: true,
 });

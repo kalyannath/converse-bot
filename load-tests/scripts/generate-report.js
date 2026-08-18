@@ -7,6 +7,12 @@
 // HTML report — pass/fail status, latency timeline, per-metric percentiles,
 // error breakdown — filed alongside the JSON so every run leaves a report
 // the way a Playwright run leaves playwright-report/index.html.
+//
+// The report has two tabs: "Overview" (plain language, for whoever's
+// reading the headline numbers — a lead, a PM) and "Engineering details"
+// (the full percentile tables, error breakdown, and raw counters). Both are
+// derived from the same result.json — there's no separate audience-specific
+// data source, just a different lens on it.
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -20,6 +26,12 @@ function escapeHtml(str) {
 function fmt(n, digits = 1) {
   if (n === undefined || n === null || Number.isNaN(n)) return '—';
   return Number(n).toLocaleString(undefined, { maximumFractionDigits: digits, minimumFractionDigits: 0 });
+}
+
+function friendlyDuration(ms) {
+  if (ms === undefined || ms === null || Number.isNaN(ms)) return 'n/a';
+  if (ms < 1000) return `${fmt(ms, 0)} ms`;
+  return `${fmt(ms / 1000, 1)}s`;
 }
 
 function sumErrorCounters(counters) {
@@ -41,6 +53,109 @@ function buildSparklinePath(values, width, height, padding = 4) {
   }));
   const path = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(' ');
   return { path, points, max, min };
+}
+
+// Artillery's per-window `intermediate` snapshots report connections/sec
+// (arrival rate), not concurrent users directly. This converts one to the
+// other with Little's Law (L = λW): concurrent users in flight ≈ arrival
+// rate × average time each one spends in the system, using THAT WINDOW's
+// own session-length mean (not the global aggregate, which gets dragged up
+// by any later slow/broken windows and would overstate concurrency
+// everywhere else).
+function computeWindows(result) {
+  const intermediate = result.intermediate || [];
+  const globalSessionMeanMs = (result.aggregate?.summaries || {})['vusers.session_length']?.mean;
+  const firstPeriod = intermediate.length ? Number(intermediate[0].period) : 0;
+
+  return intermediate.map((snap, i) => {
+    const period = Number(snap.period);
+    const prevPeriod = i > 0 ? Number(intermediate[i - 1].period) : null;
+    const durationSec = prevPeriod !== null ? (period - prevPeriod) / 1000 : 10;
+    const created = snap.counters?.['vusers.created'] ?? 0;
+    const failed = snap.counters?.['vusers.failed'] ?? 0;
+    const sessionMeanMs = snap.summaries?.['vusers.session_length']?.mean ?? globalSessionMeanMs ?? null;
+    const arrivalRate = durationSec > 0 ? created / durationSec : 0;
+    const concurrency = sessionMeanMs != null ? arrivalRate * (sessionMeanMs / 1000) : null;
+    const errorRatePct = created > 0 ? (failed / created) * 100 : 0;
+    return {
+      t: (period - firstPeriod) / 1000,
+      created,
+      failed,
+      arrivalRate,
+      concurrency,
+      errorRatePct,
+    };
+  });
+}
+
+// Walks the windows in chronological (= load-ascending, for a ramp test)
+// order and picks: the highest-load window that was still essentially
+// clean (<=1% errors), and the first window where things clearly broke
+// (>5% errors). Windows with too few samples are ignored so a single
+// dropped connection early on doesn't get read as "5% error rate".
+function computeFindings(result) {
+  const COMFORTABLE_MAX_ERR_PCT = 1;
+  const BREAKING_MIN_ERR_PCT = 5;
+  const MIN_SAMPLE = 5;
+
+  const allWindows = computeWindows(result);
+  const usable = allWindows.filter((w) => w.created >= MIN_SAMPLE && w.concurrency != null);
+
+  let comfortable = null;
+  let breaking = null;
+  for (const w of usable) {
+    if (w.errorRatePct > BREAKING_MIN_ERR_PCT) {
+      breaking = w;
+      break;
+    }
+    if (w.errorRatePct <= COMFORTABLE_MAX_ERR_PCT) {
+      comfortable = w;
+    }
+  }
+  // Once things start breaking, queued/backlogged requests finish (or
+  // time out) in later windows and inflate that window's own session-length
+  // mean — which would make "peak" pick a post-breakdown window and report
+  // it as if it were healthy. Restrict peak-finding to windows before the
+  // break, so it stays a meaningful fallback for the "comfortable capacity"
+  // card on runs that never produced a clean low-error window.
+  const preBreakWindows = breaking ? usable.filter((w) => w.t < breaking.t) : usable;
+  const peak = preBreakWindows.reduce((max, w) => (max === null || w.concurrency > max.concurrency ? w : max), null);
+
+  return { allWindows, usable, comfortable, breaking, peak, neverBroke: !breaking };
+}
+
+function buildNarrative(findings, overall) {
+  const parts = [];
+  if (findings.comfortable) {
+    parts.push(
+      `Up to roughly ${fmt(findings.comfortable.concurrency, 0)} people using the app at the same time, everything worked normally with essentially no errors.`,
+    );
+  } else if (findings.peak) {
+    parts.push(
+      `Even at the highest load reached in this test (roughly ${fmt(findings.peak.concurrency, 0)} concurrent users), the app kept working with no significant errors.`,
+    );
+  } else {
+    parts.push('This run didn’t generate enough traffic in any single window to estimate concurrent users reliably.');
+  }
+
+  if (findings.breaking) {
+    parts.push(
+      `Past roughly ${fmt(findings.breaking.concurrency, 0)} concurrent users, requests started failing — about ${fmt(findings.breaking.errorRatePct, 0)}% of them in that window — which is the breaking point this test found.`,
+    );
+  } else if (overall.created > 0) {
+    parts.push(
+      `This test never pushed the app past its limit — the overall failure rate stayed at ${fmt(overall.failRate, 1)}% across the whole run, so the real breaking point is higher than what was tested here.`,
+    );
+  }
+  return parts.join(' ');
+}
+
+function extractTarget(scriptPath) {
+  if (process.env.LOAD_TEST_TARGET) return process.env.LOAD_TEST_TARGET;
+  if (!scriptPath || !fs.existsSync(scriptPath)) return undefined;
+  const text = fs.readFileSync(scriptPath, 'utf8');
+  const match = text.match(/target[:=]\s*['"]([^'"]+)['"]/);
+  return match ? match[1] : undefined;
 }
 
 function generateHtml(result, meta) {
@@ -97,6 +212,28 @@ function generateHtml(result, meta) {
     return `<rect class="err-bar" x="${x.toFixed(2)}" y="${(chartH - h).toFixed(2)}" width="${Math.max(barW - 1, 1).toFixed(2)}" height="${h.toFixed(2)}"><title>${fmt(p.t, 0)}s: ${p.errs} error(s)</title></rect>`;
   }).join('');
 
+  // --- Overview tab data ---
+  const findings = computeFindings(result);
+  const narrative = buildNarrative(findings, { created, failRate });
+  const concLine = buildSparklinePath(findings.allWindows.map((w) => w.concurrency ?? 0), chartW, chartH);
+  const maxErrPct = Math.max(...findings.allWindows.map((w) => w.errorRatePct), 1);
+  const concBarW = findings.allWindows.length ? (chartW - 8) / findings.allWindows.length : 0;
+  const concErrorBars = findings.allWindows.map((w, i) => {
+    if (!w.errorRatePct) return '';
+    const h = (w.errorRatePct / maxErrPct) * (chartH - 8);
+    const x = 4 + i * concBarW;
+    return `<rect class="err-bar" x="${x.toFixed(2)}" y="${(chartH - h).toFixed(2)}" width="${Math.max(concBarW - 1, 1).toFixed(2)}" height="${h.toFixed(2)}"><title>${fmt(w.t, 0)}s: ${fmt(w.errorRatePct, 0)}% errors</title></rect>`;
+  }).join('');
+
+  const typicalReplyMs = summaries[headlineKey]?.median;
+
+  const comfortableCard = findings.comfortable
+    ? `~${fmt(findings.comfortable.concurrency, 0)} users`
+    : (findings.peak ? `~${fmt(findings.peak.concurrency, 0)} users (untested further)` : '—');
+  const breakingCard = findings.breaking
+    ? `~${fmt(findings.breaking.concurrency, 0)} users`
+    : 'Not reached in this test';
+
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -118,7 +255,7 @@ function generateHtml(result, meta) {
     --mono: 'SF Mono', 'Cascadia Code', Consolas, monospace;
   }
   @media (prefers-color-scheme: dark) {
-    :root {
+    :root:not([data-theme="light"]) {
       --bg: #14161a;
       --surface: #1c1f26;
       --border: #2b2f38;
@@ -132,6 +269,19 @@ function generateHtml(result, meta) {
       --bad-soft: #3a1c22;
     }
   }
+  :root[data-theme="dark"] {
+    --bg: #14161a;
+    --surface: #1c1f26;
+    --border: #2b2f38;
+    --text: #e8eaee;
+    --text-muted: #9aa1ad;
+    --accent: #7f97ff;
+    --accent-soft: #232a4a;
+    --good: #4fce8b;
+    --good-soft: #16302233;
+    --bad: #f0798a;
+    --bad-soft: #3a1c22;
+  }
   * { box-sizing: border-box; }
   body {
     margin: 0;
@@ -142,7 +292,7 @@ function generateHtml(result, meta) {
   }
   main { max-width: 920px; margin: 0 auto; }
   h1 { font-size: 1.4rem; margin: 0 0 4px; }
-  .meta { color: var(--text-muted); font-size: 0.85rem; margin-bottom: 24px; }
+  .meta { color: var(--text-muted); font-size: 0.85rem; margin-bottom: 20px; }
   .status-badge {
     display: inline-flex; align-items: center; gap: 6px;
     padding: 3px 12px; border-radius: 999px; font-weight: 600; font-size: 0.8rem;
@@ -150,6 +300,18 @@ function generateHtml(result, meta) {
   }
   .status-badge.pass { background: var(--good-soft); color: var(--good); }
   .status-badge.fail { background: var(--bad-soft); color: var(--bad); }
+
+  .tabbar { display: flex; gap: 4px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 4px; margin-bottom: 24px; width: fit-content; }
+  .tab-btn {
+    appearance: none; border: none; background: transparent; color: var(--text-muted);
+    font: inherit; font-weight: 600; font-size: 0.85rem; padding: 8px 18px; border-radius: 7px; cursor: pointer;
+  }
+  .tab-btn.active { background: var(--accent); color: #fff; }
+  .tab-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .tab-panel[hidden] { display: none; }
+
+  .verdict { background: var(--accent-soft); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; margin-bottom: 24px; font-size: 0.98rem; }
+
   .cards {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
     gap: 12px; margin: 20px 0 28px;
@@ -161,6 +323,7 @@ function generateHtml(result, meta) {
   .card .label { font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.03em; }
   .card .value { font-size: 1.5rem; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
   .card .value.bad { color: var(--bad); }
+  .card .value.small { font-size: 1.15rem; }
   section { margin-bottom: 32px; }
   h2 { font-size: 1rem; margin: 0 0 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
   table { width: 100%; border-collapse: collapse; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
@@ -174,6 +337,13 @@ function generateHtml(result, meta) {
   .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
   .err-bar { fill: var(--bad); opacity: 0.55; }
   .empty { color: var(--text-muted); font-size: 0.9rem; padding: 12px 0; }
+  ul.plain { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 16px 16px 34px; margin: 0; }
+  ul.plain li { margin-bottom: 10px; }
+  ul.plain li:last-child { margin-bottom: 0; }
+  ul.plain b { color: var(--text); }
+  details.methodology { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; font-size: 0.85rem; color: var(--text-muted); }
+  details.methodology summary { cursor: pointer; color: var(--text); font-weight: 600; }
+  details.methodology p { margin: 10px 0 0; }
   footer { color: var(--text-muted); font-size: 0.78rem; margin-top: 40px; }
 </style>
 </head>
@@ -186,91 +356,176 @@ function generateHtml(result, meta) {
     <span class="status-badge ${passed ? 'pass' : 'fail'}">${passed ? 'Passed' : 'Failed'}</span>
   </div>
 
-  <div class="cards">
-    <div class="card"><div class="label">VUsers created</div><div class="value">${fmt(created, 0)}</div></div>
-    <div class="card"><div class="label">Completed</div><div class="value">${fmt(completed, 0)}</div></div>
-    <div class="card"><div class="label">Failed</div><div class="value ${failed ? 'bad' : ''}">${fmt(failed, 0)}</div></div>
-    <div class="card"><div class="label">Fail rate</div><div class="value ${failRate > 0 ? 'bad' : ''}">${fmt(failRate, 1)}%</div></div>
-    <div class="card"><div class="label">Duration</div><div class="value">${fmt(durationS, 0)}s</div></div>
+  <div class="tabbar" role="tablist">
+    <button class="tab-btn active" data-tab="overview" role="tab" aria-selected="true">Overview</button>
+    <button class="tab-btn" data-tab="engineering" role="tab" aria-selected="false">Engineering details</button>
   </div>
 
-  <section>
-    <h2>Latency &amp; errors over time${headlineKey ? ` — ${escapeHtml(headlineKey)}` : ''}</h2>
-    ${timeline.length ? `
-    <div class="chart-wrap">
-      <div class="legend">
-        <span><span class="swatch" style="background:var(--accent)"></span>p95</span>
-        <span><span class="swatch" style="background:var(--text-muted)"></span>median</span>
-        <span><span class="swatch" style="background:var(--bad);opacity:.55"></span>errors / period</span>
-      </div>
-      <svg viewBox="0 0 ${chartW} ${chartH}" width="100%" height="${chartH}" preserveAspectRatio="none">
-        ${errorBars}
-        <path d="${medianPath}" fill="none" stroke="var(--text-muted)" stroke-width="1.5" />
-        <path d="${p95Path}" fill="none" stroke="var(--accent)" stroke-width="2" />
-      </svg>
-    </div>` : `<div class="empty">No time-series data was recorded for this run.</div>`}
+  <section class="tab-panel" data-tab-panel="overview">
+    <div class="verdict">${narrative}</div>
+
+    <div class="cards">
+      <div class="card"><div class="label">Comfortable capacity</div><div class="value small">${comfortableCard}</div></div>
+      <div class="card"><div class="label">Breaking point</div><div class="value small">${breakingCard}</div></div>
+      <div class="card"><div class="label">Errors overall</div><div class="value ${failRate > 0 ? 'bad' : ''}">${fmt(failRate, 1)}%</div></div>
+      <div class="card"><div class="label">Typical reply time</div><div class="value small">${friendlyDuration(typicalReplyMs)}</div></div>
+    </div>
+
+    <section>
+      <h2>Load vs. errors over the test</h2>
+      ${findings.allWindows.length ? `
+      <div class="chart-wrap">
+        <div class="legend">
+          <span><span class="swatch" style="background:var(--accent)"></span>estimated concurrent users</span>
+          <span><span class="swatch" style="background:var(--bad);opacity:.55"></span>error rate in that moment</span>
+        </div>
+        <svg viewBox="0 0 ${chartW} ${chartH}" width="100%" height="${chartH}" preserveAspectRatio="none">
+          ${concErrorBars}
+          <path d="${concLine.path}" fill="none" stroke="var(--accent)" stroke-width="2" />
+        </svg>
+      </div>` : `<div class="empty">No time-series data was recorded for this run.</div>`}
+    </section>
+
+    <section>
+      <h2>What this covered, and what else is worth testing</h2>
+      <ul class="plain">
+        <li><b>This test:</b> how many people can use the chat at the same time before responses slow down or fail, and roughly where that limit sits today.</li>
+        <li><b>Sustained load (soak):</b> running a steady, moderate load for several minutes instead of a short spike — catches slow leaks or gradual slowdowns a quick test misses.</li>
+        <li><b>Recovery:</b> after pushing past the breaking point, does the app recover on its own once load drops back down, or does it stay stuck/erroring?</li>
+        <li><b>Cold starts:</b> the free hosting tier used here spins the server down after ~15 minutes idle; the first user after that idle period waits 30-60s. Worth deciding if that's acceptable.</li>
+        <li><b>Real-AI cost &amp; latency:</b> a smaller test using real OpenAI replies (not the fast mocked ones used to find the ceiling above) to see true response times and per-conversation cost users will actually experience.</li>
+        <li><b>Frontend performance:</b> this test talks to the server directly; it doesn't measure how the web page itself performs on a slow device or connection.</li>
+      </ul>
+    </section>
   </section>
 
-  <section>
-    <h2>Response time / duration metrics</h2>
-    ${summaryRows.length ? `
-    <table>
-      <thead><tr><th>Metric</th><th>Count</th><th>Min</th><th>Median</th><th>Mean</th><th>p95</th><th>p99</th><th>Max</th></tr></thead>
-      <tbody>
-        ${summaryRows.map(([k, s]) => `<tr>
-          <td><code>${escapeHtml(k)}</code></td>
-          <td>${fmt(s.count, 0)}</td>
-          <td>${fmt(s.min)}</td>
-          <td>${fmt(s.median)}</td>
-          <td>${fmt(s.mean)}</td>
-          <td>${fmt(s.p95)}</td>
-          <td>${fmt(s.p99)}</td>
-          <td>${fmt(s.max)}</td>
-        </tr>`).join('')}
-      </tbody>
-    </table>` : `<div class="empty">No latency metrics were recorded — every request may have failed before completing.</div>`}
-  </section>
+  <section class="tab-panel" data-tab-panel="engineering" hidden>
+    <div class="cards">
+      <div class="card"><div class="label">VUsers created</div><div class="value">${fmt(created, 0)}</div></div>
+      <div class="card"><div class="label">Completed</div><div class="value">${fmt(completed, 0)}</div></div>
+      <div class="card"><div class="label">Failed</div><div class="value ${failed ? 'bad' : ''}">${fmt(failed, 0)}</div></div>
+      <div class="card"><div class="label">Fail rate</div><div class="value ${failRate > 0 ? 'bad' : ''}">${fmt(failRate, 1)}%</div></div>
+      <div class="card"><div class="label">Duration</div><div class="value">${fmt(durationS, 0)}s</div></div>
+    </div>
 
-  <section>
-    <h2>Errors</h2>
-    ${errorEntries.length ? `
-    <table>
-      <thead><tr><th>Error</th><th>Count</th></tr></thead>
-      <tbody>
-        ${errorEntries.map(([k, v]) => `<tr><td>${escapeHtml(k.replace(/^errors\\./, ''))}</td><td>${fmt(v, 0)}</td></tr>`).join('')}
-      </tbody>
-    </table>` : `<div class="empty">No errors reported.</div>`}
-  </section>
+    <section>
+      <h2>Latency &amp; errors over time${headlineKey ? ` — ${escapeHtml(headlineKey)}` : ''}</h2>
+      ${timeline.length ? `
+      <div class="chart-wrap">
+        <div class="legend">
+          <span><span class="swatch" style="background:var(--accent)"></span>p95</span>
+          <span><span class="swatch" style="background:var(--text-muted)"></span>median</span>
+          <span><span class="swatch" style="background:var(--bad);opacity:.55"></span>errors / period</span>
+        </div>
+        <svg viewBox="0 0 ${chartW} ${chartH}" width="100%" height="${chartH}" preserveAspectRatio="none">
+          ${errorBars}
+          <path d="${medianPath}" fill="none" stroke="var(--text-muted)" stroke-width="1.5" />
+          <path d="${p95Path}" fill="none" stroke="var(--accent)" stroke-width="2" />
+        </svg>
+      </div>` : `<div class="empty">No time-series data was recorded for this run.</div>`}
+    </section>
 
-  <section>
-    <h2>Other counters</h2>
-    ${otherCounters.length ? `
-    <table>
-      <thead><tr><th>Counter</th><th>Value</th></tr></thead>
-      <tbody>
-        ${otherCounters.map(([k, v]) => `<tr><td><code>${escapeHtml(k)}</code></td><td>${fmt(v, 0)}</td></tr>`).join('')}
-      </tbody>
-    </table>` : `<div class="empty">—</div>`}
+    <section>
+      <h2>Response time / duration metrics</h2>
+      ${summaryRows.length ? `
+      <table>
+        <thead><tr><th>Metric</th><th>Count</th><th>Min</th><th>Median</th><th>Mean</th><th>p95</th><th>p99</th><th>Max</th></tr></thead>
+        <tbody>
+          ${summaryRows.map(([k, s]) => `<tr>
+            <td><code>${escapeHtml(k)}</code></td>
+            <td>${fmt(s.count, 0)}</td>
+            <td>${fmt(s.min)}</td>
+            <td>${fmt(s.median)}</td>
+            <td>${fmt(s.mean)}</td>
+            <td>${fmt(s.p95)}</td>
+            <td>${fmt(s.p99)}</td>
+            <td>${fmt(s.max)}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>` : `<div class="empty">No latency metrics were recorded — every request may have failed before completing.</div>`}
+    </section>
+
+    <section>
+      <h2>Errors</h2>
+      ${errorEntries.length ? `
+      <table>
+        <thead><tr><th>Error</th><th>Count</th></tr></thead>
+        <tbody>
+          ${errorEntries.map(([k, v]) => `<tr><td>${escapeHtml(k.replace(/^errors\\./, ''))}</td><td>${fmt(v, 0)}</td></tr>`).join('')}
+        </tbody>
+      </table>` : `<div class="empty">No errors reported.</div>`}
+    </section>
+
+    <section>
+      <h2>Other counters</h2>
+      ${otherCounters.length ? `
+      <table>
+        <thead><tr><th>Counter</th><th>Value</th></tr></thead>
+        <tbody>
+          ${otherCounters.map(([k, v]) => `<tr><td><code>${escapeHtml(k)}</code></td><td>${fmt(v, 0)}</td></tr>`).join('')}
+        </tbody>
+      </table>` : `<div class="empty">—</div>`}
+    </section>
+
+    <section>
+      <h2>Concurrent-user estimate, by window</h2>
+      <details class="methodology">
+        <summary>Methodology</summary>
+        <p>Artillery reports connections/sec per 10s window, not concurrent users. This estimates concurrency with Little's Law
+        (L = &lambda;W): that window's arrival rate &times; that window's own mean session length. Windows use their own local
+        session-length mean rather than the run's global mean, since a global mean gets dragged up by any later slow/broken
+        windows and would overstate concurrency in the healthy windows. Windows with fewer than 5 created VUs are excluded from
+        the comfortable/breaking-point analysis (too few samples to trust an error rate from), but are still listed below.</p>
+      </details>
+      ${findings.allWindows.length ? `
+      <table style="margin-top:12px;">
+        <thead><tr><th>t (s)</th><th>Arrival rate /s</th><th>Est. concurrency</th><th>Error rate</th></tr></thead>
+        <tbody>
+          ${findings.allWindows.map((w) => `<tr>
+            <td>${fmt(w.t, 0)}</td>
+            <td>${fmt(w.arrivalRate, 1)}</td>
+            <td>${w.concurrency != null ? fmt(w.concurrency, 0) : '—'}</td>
+            <td class="${w.errorRatePct > 5 ? 'bad' : ''}">${fmt(w.errorRatePct, 1)}%</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>` : `<div class="empty">No time-series data was recorded for this run.</div>`}
+    </section>
   </section>
 
   <footer>Generated by scripts/generate-report.js from ${escapeHtml(meta.jsonFile)}</footer>
 </main>
+<script>
+  document.querySelectorAll('.tab-btn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      document.querySelectorAll('.tab-btn').forEach(function (b) {
+        b.classList.remove('active');
+        b.setAttribute('aria-selected', 'false');
+      });
+      document.querySelectorAll('.tab-panel').forEach(function (p) {
+        p.hidden = true;
+      });
+      btn.classList.add('active');
+      btn.setAttribute('aria-selected', 'true');
+      document.querySelector('[data-tab-panel="' + btn.dataset.tab + '"]').hidden = false;
+    });
+  });
+</script>
 </body>
 </html>
 `;
 }
 
 function main() {
-  const [, , jsonPath, outPath] = process.argv;
+  const [, , jsonPath, outPath, scriptPath] = process.argv;
   if (!jsonPath) {
-    console.error('Usage: node scripts/generate-report.js <result.json> [output.html]');
+    console.error('Usage: node scripts/generate-report.js <result.json> [output.html] [source-script]');
     process.exit(1);
   }
   const result = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
   const html = generateHtml(result, {
     name: path.basename(path.dirname(path.dirname(jsonPath))) || 'Load Test',
     timestamp: new Date().toLocaleString(),
-    target: undefined,
+    target: extractTarget(scriptPath),
     jsonFile: path.basename(jsonPath),
   });
   const dest = outPath || jsonPath.replace(/\.json$/, '.html');
@@ -282,4 +537,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { generateHtml };
+module.exports = { generateHtml, computeFindings, computeWindows };

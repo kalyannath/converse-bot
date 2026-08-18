@@ -1,0 +1,86 @@
+config:
+  # Hits the LIVE Render deployment directly over Socket.IO (bypassing Vercel
+  # entirely, same rationale as socket-flow.yml — this finds the backend's
+  # own ceiling, not "how many Chromium tabs fit on my laptop").
+  #
+  # REQUIRES LOAD_TEST=true set on Render for the duration of this run.
+  # Without it, every VU triggers a real gpt-4o-mini call: the exact-match
+  # `response.data` below (see socket-flow.yml's comment for why it must be
+  # an exact match, not `match`/JSONPath) will never match real generated
+  # text, so every request will silently eat the full response timeout
+  # instead of reporting its real latency, AND you'll pay OpenAI for load-test
+  # traffic. Flip it back to unset/false on Render when this run is done —
+  # see deployed-realistic.yml for the real-OpenAI leg of this test.
+  #
+  # Render's free tier is a single instance on 0.1 CPU / 512MB with no
+  # autoscaling, so phases below stage more gradually than socket-flow.yml's
+  # local run (which only started bending around arrivalRate 100) — the goal
+  # here is to pinpoint where it bends, not just confirm it eventually does.
+  # Capped at 200/sec by agreement (see report for the reasoning) rather than
+  # the 500 used locally.
+  target: "https://conversebot-backend.onrender.com"
+  socketio:
+    transports: ["websocket"]
+  phases:
+    # Render free instances spin down after ~15min idle; this also absorbs
+    # the 30-60s cold-start spin-up so it doesn't skew the real phases.
+    - name: warm up / cold start
+      duration: 20
+      arrivalRate: 2
+    - name: ramp to 15
+      duration: 20
+      arrivalRate: 2
+      rampTo: 15
+    - name: sustain at 15
+      duration: 20
+      arrivalRate: 15
+    - name: ramp to 35
+      duration: 20
+      arrivalRate: 15
+      rampTo: 35
+    - name: sustain at 35
+      duration: 20
+      arrivalRate: 35
+    - name: ramp to 60
+      duration: 20
+      arrivalRate: 35
+      rampTo: 60
+    - name: sustain at 60
+      duration: 20
+      arrivalRate: 60
+    - name: ramp to 100
+      duration: 20
+      arrivalRate: 60
+      rampTo: 100
+    - name: sustain at 100
+      duration: 20
+      arrivalRate: 100
+    - name: ramp to 150
+      duration: 20
+      arrivalRate: 100
+      rampTo: 150
+    - name: sustain at 150
+      duration: 15
+      arrivalRate: 150
+    - name: ramp to 200
+      duration: 20
+      arrivalRate: 150
+      rampTo: 200
+    - name: sustain at 200
+      duration: 15
+      arrivalRate: 200
+
+scenarios:
+  - name: single chat message
+    engine: socketio
+    flow:
+      - emit:
+          channel: "user_message"
+          data:
+            messages:
+              - role: "user"
+                content: "Say hello in one short sentence."
+        response:
+          on: "bot_done"
+          data:
+            fullText: "Hello! This is a mocked reply for load testing."

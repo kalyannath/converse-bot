@@ -1,0 +1,43 @@
+config:
+  # The "real conditions" leg of the deployed test, run AFTER deployed-ceiling.yml.
+  # Talks to production as normal — real gpt-4o-mini calls, no LOAD_TEST flag
+  # needed — so this captures true user-facing latency and confirms the app
+  # behaves under a realistic trickle of concurrent users, not the connection
+  # ceiling (that's what deployed-ceiling.yml is for, in cheap mock mode).
+  #
+  # Deliberately small and short: every VU here is a real OpenAI-billed
+  # request, so this stays around ~150-200 total messages, peaking at 6/sec,
+  # to keep cost negligible (fractions of a cent on gpt-4o-mini) and stay
+  # well clear of OpenAI's own per-minute rate limits — the point is to
+  # measure THIS app's behavior, not to get rate-limited by OpenAI and
+  # mistake that for a server problem.
+  target: "https://conversebot-backend.onrender.com"
+  socketio:
+    transports: ["websocket"]
+  processor: "./scripts/realistic-processor.js"
+  phases:
+    - name: warm up / cold start
+      duration: 10
+      arrivalRate: 1
+    - name: ramp to 3
+      duration: 15
+      arrivalRate: 1
+      rampTo: 3
+    - name: sustain at 3
+      duration: 15
+      arrivalRate: 3
+    - name: ramp to 6
+      duration: 15
+      arrivalRate: 3
+      rampTo: 6
+    - name: sustain at 6
+      duration: 10
+      arrivalRate: 6
+
+scenarios:
+  - name: real chat message
+    engine: socketio
+    flow:
+      # No `emit:`/`response:` sugar here — see scripts/realistic-processor.js
+      # for why exact-match response data doesn't work against real replies.
+      - function: "sendAndTime"
