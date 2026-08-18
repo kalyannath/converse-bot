@@ -1,0 +1,60 @@
+config:
+  # Straight at the backend's Socket.IO server (chat.gateway.ts) — no
+  # browser, no frontend build, so this can't be capped by how many real
+  # Chromium instances one machine can launch (see flows/chat-flow.ts,
+  # which hit exactly that ceiling around ~5-6 VUs/sec). This is the tool
+  # for finding the backend's own ceiling: raw connection handling, the
+  # rate-limit/in-flight guard, and Node event-loop behavior under load.
+  target: "http://localhost:3000"
+  socketio:
+    transports: ["websocket"]
+  phases:
+    # 50/sec sustained showed zero failures and flat ~340ms latency, so
+    # push well past it in stages to find where it actually bends.
+    - name: warm up
+      duration: 10
+      arrivalRate: 20
+    - name: ramp to 100
+      duration: 20
+      arrivalRate: 20
+      rampTo: 100
+    - name: sustain at 100
+      duration: 20
+      arrivalRate: 100
+    - name: ramp to 250
+      duration: 20
+      arrivalRate: 100
+      rampTo: 250
+    - name: sustain at 250
+      duration: 20
+      arrivalRate: 250
+    - name: ramp to 500
+      duration: 20
+      arrivalRate: 250
+      rampTo: 500
+    - name: sustain at 500
+      duration: 15
+      arrivalRate: 500
+
+scenarios:
+  - name: single chat message
+    engine: socketio
+    flow:
+      - emit:
+          channel: "user_message"
+          data:
+            messages:
+              - role: "user"
+                content: "Say hello in one short sentence."
+        response:
+          on: "bot_done"
+          # Must be `data` (exact object), not `match`/JSONPath: this
+          # engine version's fast-path resolver (isValid() in
+          # engine_socketio.js) only checks `response.data` — `match` is
+          # only evaluated after the full response timeout elapses, so
+          # every VU would report a fixed ~10s "response time" regardless
+          # of how fast the real reply was (confirmed by reading the
+          # engine source). Tied to MOCK_REPLY_TOKENS in openai.service.ts
+          # — update this if that mock text ever changes.
+          data:
+            fullText: "Hello! This is a mocked reply for load testing."
