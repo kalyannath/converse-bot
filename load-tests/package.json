@@ -2,8 +2,9 @@
   "name": "load-tests",
   "private": true,
   "scripts": {
-    "test:chat": "artillery run flows/chat-flow.ts",
-    "test:socket": "artillery run socket-flow.yml"
+    "test:chat": "node scripts/run-with-report.js flows/chat-flow.ts",
+    "test:socket": "node scripts/run-with-report.js socket-flow.yml",
+    "test:soak": "node scripts/run-with-report.js socket-soak.yml"
   },
   "devDependencies": {
     "artillery": "^2.0.0",
