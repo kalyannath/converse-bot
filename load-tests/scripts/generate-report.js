@@ -45,6 +45,17 @@ function preciseSeconds(ms) {
   return `${fmt(ms / 1000, 2)}s`;
 }
 
+// Different tests time the actual chat round-trip under a different metric
+// name depending on how their scenario is written: the emit/response sugar
+// (socket-flow.yml, deployed-ceiling.yml) reports it as
+// `socketio.response_time`; the custom-function tests that talk to the real
+// AI backend (deployed-realistic.yml, deployed-ceiling-ai*.yml) report it
+// under whatever name their processor chose (`realistic.response_time`).
+// This picks whichever one is actually present instead of hardcoding a name.
+function pickResponseTimeKey(summaries) {
+  return Object.keys(summaries || {}).find((k) => /response_time|duration|step\./.test(k)) ?? null;
+}
+
 function sumErrorCounters(counters) {
   return Object.entries(counters || {})
     .filter(([k]) => k.startsWith('errors.'))
@@ -149,6 +160,7 @@ function computeWindows(result) {
   const intermediate = result.intermediate || [];
   const globalSessionMeanMs = (result.aggregate?.summaries || {})['vusers.session_length']?.mean;
   const firstPeriod = intermediate.length ? Number(intermediate[0].period) : 0;
+  const latencyKey = pickResponseTimeKey(result.aggregate?.summaries);
 
   return intermediate.map((snap, i) => {
     const period = Number(snap.period);
@@ -158,6 +170,7 @@ function computeWindows(result) {
     const completed = snap.counters?.['vusers.completed'] ?? 0;
     const failed = snap.counters?.['vusers.failed'] ?? 0;
     const sessionMeanMs = snap.summaries?.['vusers.session_length']?.mean ?? globalSessionMeanMs ?? null;
+    const latencyMeanMs = latencyKey ? snap.summaries?.[latencyKey]?.mean ?? null : null;
     const arrivalRate = durationSec > 0 ? created / durationSec : 0;
     const concurrency = sessionMeanMs != null ? arrivalRate * (sessionMeanMs / 1000) : null;
     // `created` counts arrivals to THIS window; `completed`/`failed` count
@@ -178,6 +191,7 @@ function computeWindows(result) {
       resolved,
       arrivalRate,
       sessionMeanMs,
+      latencyMeanMs,
       concurrency,
       errorRatePct,
     };
@@ -346,8 +360,7 @@ function generateHtml(result, meta) {
   const summaryRows = Object.entries(summaries).sort((a, b) => b[1].count - a[1].count);
 
   // pick a headline latency metric for the timeline chart
-  const headlineKey = Object.keys(summaries).find((k) => /response_time|duration|step\./.test(k))
-    ?? Object.keys(summaries)[0];
+  const headlineKey = pickResponseTimeKey(summaries) ?? Object.keys(summaries)[0];
 
   const firstPeriod = intermediate.length ? Number(intermediate[0].period) : 0;
   const timeline = intermediate.map((snap) => {
@@ -647,7 +660,9 @@ function generateHtml(result, meta) {
       <h2>Concurrent-user estimate, by window</h2>
       <p class="caption">Est. concurrency = Arrival rate &times; Avg. session length (Little's Law) &mdash; an approximation,
         not a direct count. Error rate = Failed &divide; (Completed + Failed) for that window specifically, not a running
-        total. Windows use their own local numbers, not the run's overall average — see the FAQ below for why.</p>
+        total. Avg. latency is a separate measurement (not part of that calculation) — the mean time from sending a chat
+        message to getting a reply, for messages that finished in that window. Windows use their own local numbers, not
+        the run's overall average — see the FAQ below for why.</p>
       <details class="methodology">
         <summary>Full methodology</summary>
         <p>Artillery reports connections/sec per 10s window, not concurrent users. This estimates concurrency with Little's Law
@@ -663,11 +678,15 @@ function generateHtml(result, meta) {
         "Error rate" is "Failed" &divide; ("Completed" + "Failed") &mdash; both counted at the moment a VU finishes,
         landing in whichever window that happens to fall in. It's deliberately NOT Failed &divide; Created: once sessions
         start taking longer than one window to resolve, a VU can be created in one window and time out several windows
-        later, so comparing that window's failures against its own arrivals stops meaning anything (and can exceed 100%).</p>
+        later, so comparing that window's failures against its own arrivals stops meaning anything (and can exceed 100%).
+        "Avg. latency" is different from "Avg. session length": session length is a VU's whole lifetime (connect, send,
+        wait, disconnect), while latency is just the chat round-trip itself (send message &rarr; bot reply), so latency
+        is normally shorter than session length and the two shouldn't be expected to match. It's not used anywhere in
+        the Est. concurrency calculation above — it's shown here purely as a per-window view of response speed under load.</p>
       </details>
       ${findings.allWindows.length ? `
       <table style="margin-top:12px;">
-        <thead><tr><th>t (s)</th><th>Created</th><th>Completed</th><th>Failed</th><th>Arrival rate /s</th><th>Avg. session length</th><th>Est. concurrency</th><th>Error rate</th></tr></thead>
+        <thead><tr><th>t (s)</th><th>Created</th><th>Completed</th><th>Failed</th><th>Arrival rate /s</th><th>Avg. session length</th><th>Est. concurrency</th><th>Avg. latency</th><th>Error rate</th></tr></thead>
         <tbody>
           ${findings.allWindows.map((w) => `<tr>
             <td>${fmt(w.t, 0)}</td>
@@ -677,6 +696,7 @@ function generateHtml(result, meta) {
             <td>${fmt(w.arrivalRate, 1)}</td>
             <td>${preciseSeconds(w.sessionMeanMs)}</td>
             <td>${w.concurrency != null ? fmt(w.concurrency, 0) : '—'}</td>
+            <td>${friendlyDuration(w.latencyMeanMs)}</td>
             <td class="${w.errorRatePct > 5 ? 'bad' : ''}">${fmt(w.errorRatePct, 1)}%</td>
           </tr>`).join('')}
         </tbody>
