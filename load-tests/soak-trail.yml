@@ -1,0 +1,40 @@
+config:
+  # Endurance run against a LOCAL backend. Where the ceiling tests ramp up to
+  # find a breaking point, this holds one steady rate for five minutes to
+  # reveal the problems a short ramp structurally can't: memory/socket leaks,
+  # gradual latency creep, connection pools that never recover.
+  #
+  # 40/sec sits comfortably under the ~100/sec ceiling seen locally — and
+  # that local ceiling turned out to be Windows loopback port exhaustion on
+  # the test machine, not the app. That's exactly why this one points at
+  # localhost and the ceiling tests point at Render: this measures the app
+  # over time, not the network under it.
+  #
+  # Requires the backend running locally on :3000 with LOAD_TEST=true (the
+  # exact-match response below is the mocked reply — see
+  # ceiling-with-ai-mock.yml for what happens without that flag).
+  target: "http://localhost:3000"
+  socketio:
+    transports: ["websocket"]
+  phases:
+    - name: warm up
+      duration: 10
+      arrivalRate: 10
+    - name: soak
+      duration: 300
+      arrivalRate: 40
+
+scenarios:
+  - name: single chat message
+    engine: socketio
+    flow:
+      - emit:
+          channel: "user_message"
+          data:
+            messages:
+              - role: "user"
+                content: "Say hello in one short sentence."
+        response:
+          on: "bot_done"
+          data:
+            fullText: "Hello! This is a mocked reply for load testing."

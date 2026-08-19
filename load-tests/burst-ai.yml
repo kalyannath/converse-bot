@@ -1,0 +1,74 @@
+config:
+  # Cold-start / burst test — the shape a steady ramp can never produce.
+  #
+  # The ceiling tests (ceiling-ai-without-mock.yml, ceiling-with-ai-mock.yml)
+  # ramp monotonically: load only ever goes up, and the server is
+  # continuously warm by the time each new level arrives. Real traffic to a
+  # voice assistant doesn't look like that — it goes quiet, then a burst
+  # arrives against a server whose connection pools have drained, whose
+  # autoscaler has scaled in, and (on Render's free/starter tiers) whose
+  # instance may have been spun down entirely. A ramp test structurally
+  # cannot see that class of problem, because it never lets the system go
+  # cold.
+  #
+  # The design is deliberately symmetric: two IDENTICAL bursts separated by
+  # an idle gap. Burst 1 hits a cold system, burst 2 hits one that was busy
+  # 30s earlier. Same arrival rate, same duration, same prompts — so any
+  # difference in TTFT or error rate between the two burst windows in the
+  # report is attributable to warm-vs-cold, not to a different load level.
+  # That comparison is the entire point of this file; read the two burst
+  # phases side by side in the "expected vs. actual" table.
+  #
+  # Phases stay on 10s multiples so they line up with Artillery's fixed 10s
+  # reporting window (same reasoning as ceiling-ai-without-mock.yml).
+  #
+  # No LOAD_TEST flag — real gpt-4o-mini replies, real billed calls. Volume
+  # is kept modest (~700 messages total) so the cost stays in cents; set
+  # LOAD_TEST_COST_CAP_USD to put a hard backstop under it.
+  target: "https://conversebot-backend.onrender.com"
+  socketio:
+    transports: ["websocket"]
+  processor: "./scripts/realistic-processor.js"
+  phases:
+    # Baseline while warm — the control group for both bursts.
+    - name: warm baseline
+      duration: 10
+      arrivalRate: 3
+
+    # Long enough for idle connections to be reaped and any scale-in to
+    # happen. Shows up in the report as empty windows, which is expected.
+    - name: idle (go cold)
+      pause: 30
+
+    # Burst 1: cold. Straight to 30/sec with no ramp — no gentle onramp for
+    # the server to adapt to.
+    - name: burst 1 (cold)
+      duration: 10
+      arrivalRate: 30
+
+    # Drain: lets in-flight replies from burst 1 finish and resolve, so their
+    # completions don't bleed into burst 2's windows and confuse the
+    # comparison.
+    - name: recover
+      duration: 20
+      arrivalRate: 3
+
+    - name: idle again
+      pause: 30
+
+    # Burst 2: identical to burst 1 in every way. Any delta vs. burst 1 is
+    # the cold-start cost.
+    - name: burst 2 (warm-ish)
+      duration: 10
+      arrivalRate: 30
+
+    - name: cool down
+      duration: 10
+      arrivalRate: 3
+
+scenarios:
+  - name: real chat message
+    engine: socketio
+    flow:
+      # Custom step, not emit/response sugar — see scripts/realistic-processor.js.
+      - function: "sendAndTime"

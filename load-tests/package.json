@@ -3,12 +3,10 @@
   "private": true,
   "scripts": {
     "test:chat": "node scripts/run-with-report.js flows/chat-flow.ts",
-    "test:socket": "node scripts/run-with-report.js socket-flow.yml",
-    "test:soak": "node scripts/run-with-report.js socket-soak.yml",
-    "test:deployed-ceiling": "node scripts/run-with-report.js deployed-ceiling.yml",
-    "test:deployed-ceiling-ai": "node scripts/run-with-report.js deployed-ceiling-ai.yml",
-    "test:deployed-ceiling-ai-10s": "node scripts/run-with-report.js deployed-ceiling-ai-10s.yml",
-    "test:deployed-realistic": "node scripts/run-with-report.js deployed-realistic.yml",
+    "test:soak-trail": "node scripts/run-with-report.js soak-trail.yml",
+    "test:ceiling-with-ai-mock": "node scripts/run-with-report.js ceiling-with-ai-mock.yml",
+    "test:ceiling-ai-without-mock": "node scripts/run-with-report.js ceiling-ai-without-mock.yml",
+    "test:burst-ai": "node scripts/run-with-report.js burst-ai.yml",
     "postinstall": "patch-package"
   },
   "devDependencies": {

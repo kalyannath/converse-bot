@@ -1,0 +1,77 @@
+config:
+  # Finds the deployed backend's ceiling against REAL gpt-4o-mini replies —
+  # the same rate progression as ceiling-with-ai-mock.yml (2 -> 15 -> 35 ->
+  # 60 -> 100 -> 150 -> 200/sec), but with the model actually in the loop.
+  # Run this one to learn what the app does for real users; run
+  # ceiling-with-ai-mock.yml to isolate the server's own transport/connection
+  # capacity without the model's latency mixed in.
+  #
+  # Every phase is exactly 10 seconds, matching Artillery's own fixed 10s
+  # metrics-reporting window. That means every phase boundary lands on a
+  # window boundary: each row in the report's "Traffic ramp: expected vs.
+  # actual, by phase" table maps to exactly one window, with nothing blending
+  # into its neighbor (no "*" misalignment caveat, ever). The mock ceiling
+  # test uses 15-20s phases and does show that caveat — worth remembering
+  # when comparing the two reports side by side.
+  #
+  # No LOAD_TEST flag here — that flag is what makes the mock test cheap, and
+  # setting it would defeat the entire point of this file. Every VU below is
+  # a real, billed OpenAI call: ~10,200 of them at roughly $0.65 a run. The
+  # runner prints an estimate before it starts; set LOAD_TEST_COST_CAP_USD
+  # for a hard backstop.
+  target: "https://conversebot-backend.onrender.com"
+  socketio:
+    transports: ["websocket"]
+  processor: "./scripts/realistic-processor.js"
+  phases:
+    - name: warm up / cold start
+      duration: 10
+      arrivalRate: 2
+    - name: ramp to 15
+      duration: 10
+      arrivalRate: 2
+      rampTo: 15
+    - name: sustain at 15
+      duration: 10
+      arrivalRate: 15
+    - name: ramp to 35
+      duration: 10
+      arrivalRate: 15
+      rampTo: 35
+    - name: sustain at 35
+      duration: 10
+      arrivalRate: 35
+    - name: ramp to 60
+      duration: 10
+      arrivalRate: 35
+      rampTo: 60
+    - name: sustain at 60
+      duration: 10
+      arrivalRate: 60
+    - name: ramp to 100
+      duration: 10
+      arrivalRate: 60
+      rampTo: 100
+    - name: sustain at 100
+      duration: 10
+      arrivalRate: 100
+    - name: ramp to 150
+      duration: 10
+      arrivalRate: 100
+      rampTo: 150
+    - name: sustain at 150
+      duration: 10
+      arrivalRate: 150
+    - name: ramp to 200
+      duration: 10
+      arrivalRate: 150
+      rampTo: 200
+    - name: sustain at 200
+      duration: 10
+      arrivalRate: 200
+
+scenarios:
+  - name: real chat message
+    engine: socketio
+    flow:
+      - function: "sendAndTime"

@@ -47,13 +47,122 @@ function preciseSeconds(ms) {
 
 // Different tests time the actual chat round-trip under a different metric
 // name depending on how their scenario is written: the emit/response sugar
-// (socket-flow.yml, deployed-ceiling.yml) reports it as
+// (ceiling-with-ai-mock.yml, soak-trail.yml) reports it as
 // `socketio.response_time`; the custom-function tests that talk to the real
-// AI backend (deployed-realistic.yml, deployed-ceiling-ai*.yml) report it
+// AI backend (ceiling-ai-without-mock.yml, burst-ai.yml) report it
 // under whatever name their processor chose (`realistic.response_time`).
 // This picks whichever one is actually present instead of hardcoding a name.
 function pickResponseTimeKey(summaries) {
   return Object.keys(summaries || {}).find((k) => /response_time|duration|step\./.test(k)) ?? null;
+}
+
+// Every metric this test suite records, in plain language. Without this the
+// report dumps raw names like `realistic.inter_token_latency` next to a bare
+// number and leaves the reader to guess — including guessing the UNIT, which
+// is genuinely ambiguous: `realistic.ttft` is milliseconds and
+// `realistic.output_tokens` is a token count, but both are just numbers in
+// the same table.
+//
+// `unit` drives formatting ('ms' renders via friendlyDuration, 'count' as a
+// plain number). Anything not listed here still renders — it just falls back
+// to the raw name and no description, so adding a new metric to the
+// processor never breaks the report, it only means the glossary is one entry
+// short until someone documents it here.
+const METRIC_INFO = {
+  'realistic.ttft': {
+    label: 'Time to first token (TTFT)',
+    unit: 'ms',
+    help: 'From sending the message to the FIRST word of the reply arriving. This is the silence a user sits through wondering whether anything is happening. The reply keeps streaming after this point.',
+  },
+  'realistic.response_time': {
+    label: 'Full reply time',
+    unit: 'ms',
+    help: 'From sending the message to the LAST word of the reply (the bot_done event). Includes TTFT plus however long the rest of the reply took to generate.',
+  },
+  'realistic.inter_token_latency': {
+    label: 'Gap between words',
+    unit: 'ms',
+    help: 'Average pause between consecutive tokens within one reply. Decides whether text streams smoothly or stutters once it has started. A min of 0 is normal — two tokens can land in the same millisecond.',
+  },
+  'realistic.output_tokens': {
+    label: 'Reply length',
+    unit: 'count',
+    help: 'How many tokens (roughly, word-pieces) came back in each reply. NOT a duration — these are counts. Longer replies cost more and take longer to generate.',
+  },
+  'vusers.session_length': {
+    label: 'Whole session length',
+    unit: 'ms',
+    help: "A virtual user's entire lifetime: connect, send, wait for the reply, disconnect. Always longer than the reply time, because it includes connection setup and teardown.",
+  },
+  'socketio.response_time': {
+    label: 'Full reply time',
+    unit: 'ms',
+    help: "Artillery's own send-to-response timer, used by the mock-mode tests that rely on emit/response matching rather than the custom processor.",
+  },
+  'realistic.output_tokens_total': {
+    label: 'Total tokens generated',
+    unit: 'count',
+    help: 'Every output token across the whole run, added up. Counted exactly (one per streamed token) and used for the cost estimate.',
+  },
+  'realistic.input_tokens_est': {
+    label: 'Total tokens sent (estimated)',
+    unit: 'count',
+    help: 'Prompt text plus the system prompt the backend adds to every request. Estimated at ~4 characters per token, hence "est" — unlike output tokens, which are counted exactly.',
+  },
+  'realistic.completed': {
+    label: 'Replies received in full',
+    unit: 'count',
+    help: 'Requests that got a complete reply (bot_done) without erroring or timing out.',
+  },
+  'realistic.timeout': {
+    label: 'Timed out (25s limit)',
+    unit: 'count',
+    help: 'Requests that never finished within the 25-second cap. Always equals the two timeout rows below it added together.',
+  },
+  'realistic.timeout_before_first_token': {
+    label: '↳ …with nothing received at all',
+    unit: 'count',
+    help: 'Timed out having never received a single word — the request was still queued waiting for the model to start. A high share here points at queueing/admission, not at generation being slow.',
+  },
+  'realistic.timeout_mid_stream': {
+    label: '↳ …after the reply had started',
+    unit: 'count',
+    help: 'The reply began streaming, then stalled and never completed. Points at generation or the connection dropping mid-flight rather than at queueing.',
+  },
+  'realistic.bot_error': {
+    label: 'Server returned an error',
+    unit: 'count',
+    help: 'The backend explicitly replied with bot_error instead of a message — an application-level failure, not a network one.',
+  },
+  'realistic.empty_reply': {
+    label: 'Completed but empty',
+    unit: 'count',
+    help: 'The server said it was done without ever sending a word. Counts as a success everywhere else, but the user got nothing.',
+  },
+  'realistic.cost_cap_skipped': {
+    label: 'Skipped by cost cap',
+    unit: 'count',
+    help: 'Requests deliberately not sent because the run hit LOAD_TEST_COST_CAP_USD. These are the test stopping itself, NOT the server failing — capacity conclusions from such a run are incomplete.',
+  },
+};
+
+function metricLabel(key) {
+  return METRIC_INFO[key]?.label ?? key;
+}
+
+// Values in these tables are unit-ambiguous without this: durations get
+// humanised (1.4s), counts stay plain (43.7).
+function metricValue(key, v) {
+  return METRIC_INFO[key]?.unit === 'ms' ? friendlyDuration(v) : fmt(v, 1);
+}
+
+// Builds a glossary of only the metrics this particular run actually
+// produced, so a mock-mode report doesn't explain streaming metrics it never
+// recorded.
+function buildGlossary(keys) {
+  return keys
+    .filter((k) => METRIC_INFO[k])
+    .map((k) => ({ key: k, ...METRIC_INFO[k] }));
 }
 
 function sumErrorCounters(counters) {
@@ -161,6 +270,10 @@ function computeWindows(result) {
   const globalSessionMeanMs = (result.aggregate?.summaries || {})['vusers.session_length']?.mean;
   const firstPeriod = intermediate.length ? Number(intermediate[0].period) : 0;
   const latencyKey = pickResponseTimeKey(result.aggregate?.summaries);
+  // Only present when the scenario measures streaming (the custom
+  // sendAndTime processor). Mock/sugar-based tests won't have it, and every
+  // TTFT cell just renders as "n/a" — the column is harmless there.
+  const ttftKey = (result.aggregate?.summaries || {})['realistic.ttft'] ? 'realistic.ttft' : null;
 
   return intermediate.map((snap, i) => {
     const period = Number(snap.period);
@@ -170,7 +283,15 @@ function computeWindows(result) {
     const completed = snap.counters?.['vusers.completed'] ?? 0;
     const failed = snap.counters?.['vusers.failed'] ?? 0;
     const sessionMeanMs = snap.summaries?.['vusers.session_length']?.mean ?? globalSessionMeanMs ?? null;
-    const latencyMeanMs = latencyKey ? snap.summaries?.[latencyKey]?.mean ?? null : null;
+    const latencySummary = latencyKey ? snap.summaries?.[latencyKey] ?? null : null;
+    const latencyMeanMs = latencySummary?.mean ?? null;
+    // The mean alone hides LLM latency's heavy tail — p99 routinely lands
+    // several times the median, and that tail is what users actually notice
+    // and what capacity planning has to be sized against.
+    const latencyP95Ms = latencySummary?.p95 ?? null;
+    const latencyP99Ms = latencySummary?.p99 ?? null;
+    const ttftMeanMs = ttftKey ? snap.summaries?.[ttftKey]?.mean ?? null : null;
+    const ttftP95Ms = ttftKey ? snap.summaries?.[ttftKey]?.p95 ?? null : null;
     const arrivalRate = durationSec > 0 ? created / durationSec : 0;
     const concurrency = sessionMeanMs != null ? arrivalRate * (sessionMeanMs / 1000) : null;
     // `created` counts arrivals to THIS window; `completed`/`failed` count
@@ -192,6 +313,10 @@ function computeWindows(result) {
       arrivalRate,
       sessionMeanMs,
       latencyMeanMs,
+      latencyP95Ms,
+      latencyP99Ms,
+      ttftMeanMs,
+      ttftP95Ms,
       concurrency,
       errorRatePct,
     };
@@ -285,6 +410,47 @@ function buildConcurrencyExplainer(findings) {
   ].filter(Boolean).join(' ');
 }
 
+// Real-AI runs bill per token, and a ramp test's whole job is to send a LOT
+// of traffic — a misconfigured ceiling run against the live model is the one
+// mistake here that costs actual money rather than just time. The processor
+// records estimated input tokens and counts streamed output tokens, so this
+// turns those into a number someone can sanity-check after the fact (and,
+// via LOAD_TEST_COST_CAP_USD, that the processor enforces during the run).
+//
+// Rates default to gpt-4o-mini's published per-1M pricing and are
+// overridable, because model pricing changes more often than this script
+// does. A mock-mode run (LOAD_TEST=true on the server) never calls the
+// model, so its real cost is $0 regardless of what this estimates.
+function computeCost(counters) {
+  const inputTokens = counters['realistic.input_tokens_est'] ?? 0;
+  const outputTokens = counters['realistic.output_tokens_total'] ?? 0;
+  if (!inputTokens && !outputTokens) return null;
+
+  const perMInput = Number(process.env.LOAD_TEST_COST_PER_1M_INPUT ?? 0.15);
+  const perMOutput = Number(process.env.LOAD_TEST_COST_PER_1M_OUTPUT ?? 0.6);
+  const inputUsd = (inputTokens / 1e6) * perMInput;
+  const outputUsd = (outputTokens / 1e6) * perMOutput;
+
+  return {
+    inputTokens,
+    outputTokens,
+    inputUsd,
+    outputUsd,
+    totalUsd: inputUsd + outputUsd,
+    perMInput,
+    perMOutput,
+    capUsd: Number(process.env.LOAD_TEST_COST_CAP_USD ?? 0),
+    cappedVus: counters['realistic.cost_cap_skipped'] ?? 0,
+  };
+}
+
+function formatUsd(usd) {
+  if (usd === null || usd === undefined || Number.isNaN(usd)) return '—';
+  // Entity, not a literal '<' — this string goes straight into the HTML.
+  if (usd > 0 && usd < 0.01) return '&lt;$0.01';
+  return `$${fmt(usd, 2)}`;
+}
+
 function extractTarget(scriptPath) {
   if (process.env.LOAD_TEST_TARGET) return process.env.LOAD_TEST_TARGET;
   if (!scriptPath || !fs.existsSync(scriptPath)) return undefined;
@@ -319,16 +485,21 @@ function computePhaseBreakdown(phases, allWindows) {
   if (!phases || !phases.length || !allWindows.length) return null;
   let cursor = 0;
   const rows = phases.map((p) => {
-    const dur = Number(p.duration) || 0;
-    const r0 = Number(p.arrivalRate ?? p.rampTo ?? 0);
-    const r1 = Number(p.rampTo ?? p.arrivalRate ?? r0);
+    // A `pause` phase (burst-ai.yml) carries its length in `pause`
+    // rather than `duration` and creates no VUs at all. Without this it
+    // would measure as zero-length and silently shift every later phase's
+    // time range earlier by the length of the pause.
+    const isPause = p.pause !== undefined;
+    const dur = isPause ? Number(p.pause) || 0 : Number(p.duration) || 0;
+    const r0 = isPause ? 0 : Number(p.arrivalRate ?? p.rampTo ?? 0);
+    const r1 = isPause ? 0 : Number(p.rampTo ?? p.arrivalRate ?? r0);
     const start = cursor;
     const end = cursor + dur;
     cursor = end;
     const expected = ((r0 + r1) / 2) * dur;
     const actual = allWindows.filter((w) => w.t >= start && w.t < end).reduce((s, w) => s + w.created, 0);
     const misaligned = start % 10 !== 0 || end % 10 !== 0;
-    return { name: p.name || '(unnamed phase)', start, end, dur, r0, r1, expected, actual, misaligned };
+    return { name: p.name || (isPause ? '(pause)' : '(unnamed phase)'), start, end, dur, r0, r1, expected, actual, misaligned, isPause };
   });
   const totalCreated = allWindows.reduce((s, w) => s + w.created, 0);
   const accountedFor = rows.reduce((s, r) => s + r.actual, 0);
@@ -353,11 +524,21 @@ function generateHtml(result, meta) {
     .filter(([k]) => k.startsWith('errors.'))
     .sort((a, b) => b[1] - a[1]);
 
-  const otherCounters = Object.entries(counters)
-    .filter(([k]) => !k.startsWith('errors.') && !k.startsWith('vusers.'))
+  // Prompt-size counters get their own section below, so they're pulled out
+  // of the generic counter dump rather than listed twice.
+  const promptMix = Object.entries(counters)
+    .filter(([k]) => k.startsWith('realistic.prompt_'))
+    .map(([k, v]) => [k.replace('realistic.prompt_', ''), v])
     .sort((a, b) => b[1] - a[1]);
+  const promptMixTotal = promptMix.reduce((s, [, v]) => s + v, 0);
+
+  const otherCounters = Object.entries(counters)
+    .filter(([k]) => !k.startsWith('errors.') && !k.startsWith('vusers.') && !k.startsWith('realistic.prompt_'))
+    .sort((a, b) => b[1] - a[1]);
+  const counterGlossary = buildGlossary(otherCounters.map(([k]) => k));
 
   const summaryRows = Object.entries(summaries).sort((a, b) => b[1].count - a[1].count);
+  const summaryGlossary = buildGlossary(summaryRows.map(([k]) => k));
 
   // pick a headline latency metric for the timeline chart
   const headlineKey = pickResponseTimeKey(summaries) ?? Object.keys(summaries)[0];
@@ -386,6 +567,7 @@ function generateHtml(result, meta) {
   }) : '';
 
   // --- Overview tab data ---
+  const cost = computeCost(counters);
   const findings = computeFindings(result);
   const narrative = buildNarrative(findings, { created, failRate, durationS });
   const concurrencyExplainer = buildConcurrencyExplainer(findings);
@@ -410,6 +592,7 @@ function generateHtml(result, meta) {
   }) : '';
 
   const typicalReplyMs = summaries[headlineKey]?.median;
+  const typicalTtftMs = summaries['realistic.ttft']?.median;
 
   const comfortableCard = findings.comfortable
     ? `~${fmt(findings.comfortable.concurrency, 0)} users`
@@ -531,6 +714,10 @@ function generateHtml(result, meta) {
   .explainer { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; font-size: 0.85rem; color: var(--text-muted); margin: -12px 0 28px; }
   .explainer b { color: var(--text); }
   .caption { font-size: 0.85rem; color: var(--text-muted); margin: -6px 0 12px; }
+  .table-scroll { overflow-x: auto; }
+  .table-scroll table { min-width: 780px; }
+  .rawname { font-family: var(--mono); font-size: 0.72rem; color: var(--text-muted); font-weight: 400; }
+  details.methodology p b { color: var(--text); }
   .faq { display: flex; flex-direction: column; gap: 8px; }
   footer { color: var(--text-muted); font-size: 0.78rem; margin-top: 40px; }
 </style>
@@ -556,10 +743,18 @@ function generateHtml(result, meta) {
       <div class="card"><div class="label">Comfortable capacity</div><div class="value small">${comfortableCard}</div></div>
       <div class="card"><div class="label">Breaking point</div><div class="value small">${breakingCard}</div></div>
       <div class="card"><div class="label">Errors overall</div><div class="value ${failRate > 0 ? 'bad' : ''}">${fmt(failRate, 1)}%</div></div>
+      ${typicalTtftMs != null ? `<div class="card"><div class="label">Typical wait to start</div><div class="value small">${friendlyDuration(typicalTtftMs)}</div></div>` : ''}
       <div class="card"><div class="label">Typical reply time</div><div class="value small">${friendlyDuration(typicalReplyMs)}</div></div>
+      ${cost ? `<div class="card"><div class="label">Est. AI cost</div><div class="value small">${formatUsd(cost.totalUsd)}</div></div>` : ''}
     </div>
 
     ${concurrencyExplainer ? `<div class="explainer"><b>How the two numbers above are worked out:</b> ${concurrencyExplainer} "People at once" is an estimate (arrival rate &times; average wait), not a direct headcount — Artillery only measures messages/sec directly.</div>` : ''}
+
+    ${typicalTtftMs != null ? `<div class="explainer"><b>"Wait to start" vs. "reply time":</b> the assistant streams its answer word by word, so people see it begin
+      long before it's finished. <b>Wait to start</b> (${friendlyDuration(typicalTtftMs)}) is the silence before the first
+      word appears — that's the part that feels like waiting. <b>Reply time</b> (${friendlyDuration(typicalReplyMs)}) is
+      until the last word arrives, which people spend reading rather than waiting. A short wait to start feels responsive
+      even when the full reply takes several seconds.</div>` : ''}
 
     <section>
       <h2>Load vs. errors over the test</h2>
@@ -613,24 +808,42 @@ function generateHtml(result, meta) {
     </section>
 
     <section>
-      <h2>Response time / duration metrics</h2>
-      <p class="caption">Aggregated across the whole run, not broken down by window — see "Concurrent-user estimate, by window" below for the time-sliced view.</p>
+      <h2>What was measured, across the whole run</h2>
+      <p class="caption">Every measurement this test takes, with its spread. Not broken down by time — see "Concurrent-user
+        estimate, by window" below for that. <b>Median</b> is the middle value (half were faster); <b>p95</b>/<b>p99</b> are
+        the slowest 5% and 1%, which is where bad experiences hide. Units differ by row and are shown in the values —
+        durations read as "1.4s", counts as plain numbers.</p>
       ${summaryRows.length ? `
+      <div class="table-scroll">
       <table>
-        <thead><tr><th>Metric</th><th>Count</th><th>Min</th><th>Median</th><th>Mean</th><th>p95</th><th>p99</th><th>Max</th></tr></thead>
+        <thead><tr><th>Measurement</th><th>Samples</th><th>Min</th><th>Median</th><th>Mean</th><th>p95</th><th>p99</th><th>Max</th></tr></thead>
         <tbody>
           ${summaryRows.map(([k, s]) => `<tr>
-            <td><code>${escapeHtml(k)}</code></td>
+            <td>${escapeHtml(metricLabel(k))}<br><code class="rawname">${escapeHtml(k)}</code></td>
             <td>${fmt(s.count, 0)}</td>
-            <td>${fmt(s.min)}</td>
-            <td>${fmt(s.median)}</td>
-            <td>${fmt(s.mean)}</td>
-            <td>${fmt(s.p95)}</td>
-            <td>${fmt(s.p99)}</td>
-            <td>${fmt(s.max)}</td>
+            <td>${metricValue(k, s.min)}</td>
+            <td>${metricValue(k, s.median)}</td>
+            <td>${metricValue(k, s.mean)}</td>
+            <td>${metricValue(k, s.p95)}</td>
+            <td>${metricValue(k, s.p99)}</td>
+            <td>${metricValue(k, s.max)}</td>
           </tr>`).join('')}
         </tbody>
-      </table>` : `<div class="empty">No latency metrics were recorded — every request may have failed before completing.</div>`}
+      </table>
+      </div>
+      ${summaryGlossary.length ? `
+      <details class="methodology" style="margin-top:12px;">
+        <summary>What each of these means</summary>
+        <p><b>Why the "Samples" counts don't all match.</b> Each row is recorded at a different moment in a request's life.
+        Time to first token is recorded the instant the first word arrives &mdash; before anything is known about how the
+        request ends. The other rows are only recorded once a reply <i>finishes completely</i>. So a reply that started
+        streaming and then stalled contributes to TTFT and to nothing else: that's why TTFT's sample count is higher, and
+        the difference equals "&hellip;after the reply had started" in Outcome tallies below. It's a useful cross-check &mdash;
+        if those two stop reconciling, the measurements are wrong. One caveat it creates: stalled replies are slow by
+        definition, so "Full reply time" excludes the worst-behaved requests and reads slightly optimistic. Negligible when
+        mid-stream stalls are a fraction of a percent; worth discounting if that number ever grows.</p>
+        ${summaryGlossary.map((g) => `<p><b>${escapeHtml(g.label)}</b> <code class="rawname">${escapeHtml(g.key)}</code><br>${escapeHtml(g.help)}</p>`).join('')}
+      </details>` : ''}` : `<div class="empty">No latency metrics were recorded — every request may have failed before completing.</div>`}
     </section>
 
     <section>
@@ -645,24 +858,87 @@ function generateHtml(result, meta) {
       </table>` : `<div class="empty">No errors reported.</div>`}
     </section>
 
+    ${cost ? `
     <section>
-      <h2>Other counters</h2>
+      <h2>Estimated AI spend</h2>
+      <p class="caption">What this run cost in model usage, from tokens actually counted during the test &mdash;
+        output tokens are counted exactly (one per streamed <code>bot_token</code>), input tokens are estimated at
+        ~4 characters per token. Priced at $${fmt(cost.perMInput, 2)}/1M input and $${fmt(cost.perMOutput, 2)}/1M output
+        (gpt-4o-mini defaults; override with <code>LOAD_TEST_COST_PER_1M_INPUT</code> / <code>_OUTPUT</code>).</p>
+      <table>
+        <thead><tr><th>Item</th><th>Tokens</th><th>Est. cost</th></tr></thead>
+        <tbody>
+          <tr><td>Input (prompts + system prompt)</td><td>${fmt(cost.inputTokens, 0)}</td><td>${formatUsd(cost.inputUsd)}</td></tr>
+          <tr><td>Output (streamed reply tokens)</td><td>${fmt(cost.outputTokens, 0)}</td><td>${formatUsd(cost.outputUsd)}</td></tr>
+          <tr><td><b>Total</b></td><td>${fmt(cost.inputTokens + cost.outputTokens, 0)}</td><td><b>${formatUsd(cost.totalUsd)}</b></td></tr>
+        </tbody>
+      </table>
+      ${cost.cappedVus > 0 ? `<p class="caption bad" style="margin-top:12px;"><b>Cost cap tripped.</b>
+        ${fmt(cost.cappedVus, 0)} VUs were skipped without calling the model because estimated spend reached the
+        <code>LOAD_TEST_COST_CAP_USD</code> limit of $${fmt(cost.capUsd, 2)}. Those show up as failures in the tables
+        above, but they are the test stopping itself &mdash; not the server failing. Treat any capacity conclusion from
+        this run as incomplete.</p>` : ''}
+      <details class="methodology">
+        <summary>How accurate is this, and when is it zero?</summary>
+        <p>Output tokens are a real count, not an estimate: the backend emits one <code>bot_token</code> event per token
+        it streams, and the test counts them. Input tokens are approximated at 4 characters/token (the standard rule of
+        thumb for English) plus a fixed ~45 tokens for the system prompt the backend prepends to every request, since
+        running a real tokenizer inside the load generator's hot path would cost more than the precision is worth here.
+        Expect this total to be within a few percent of the provider's own billing, which is accurate enough for its
+        actual job: catching "this run is about to cost real money" before it does.</p>
+        <p>A mock-mode run (<code>LOAD_TEST=true</code> on the server) never calls the model at all, so its true cost is
+        <b>$0</b> no matter what this section says &mdash; the token counts are still real, they just weren't billed.
+        Set both rate variables to <code>0</code> for mock runs if you want this to read zero.</p>
+      </details>
+    </section>` : ''}
+
+    ${promptMix.length ? `
+    <section>
+      <h2>Prompt mix</h2>
+      <p class="caption">Which sizes of prompt were actually sent. The test samples from a pool spanning one-line
+        questions to multi-part ones, because identical trivial prompts produce identical trivial replies &mdash; which
+        flattens the reply-length variance that drives real tail latency, and makes p95/p99 look better than they are.</p>
+      <table>
+        <thead><tr><th>Prompt size</th><th>Messages sent</th><th>Share</th></tr></thead>
+        <tbody>
+          ${promptMix.map(([size, n]) => `<tr>
+            <td>${escapeHtml(size)}</td>
+            <td>${fmt(n, 0)}</td>
+            <td>${fmt((n / promptMixTotal) * 100, 0)}%</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </section>` : ''}
+
+    <section>
+      <h2>Outcome tallies</h2>
+      <p class="caption">Running totals for the whole run — how many requests ended each way, and how many tokens moved.
+        Unlike the table above these are single counts, not distributions.</p>
       ${otherCounters.length ? `
       <table>
-        <thead><tr><th>Counter</th><th>Value</th></tr></thead>
+        <thead><tr><th>What happened</th><th>Count</th></tr></thead>
         <tbody>
-          ${otherCounters.map(([k, v]) => `<tr><td><code>${escapeHtml(k)}</code></td><td>${fmt(v, 0)}</td></tr>`).join('')}
+          ${otherCounters.map(([k, v]) => `<tr>
+            <td>${escapeHtml(metricLabel(k))}<br><code class="rawname">${escapeHtml(k)}</code></td>
+            <td>${fmt(v, 0)}</td>
+          </tr>`).join('')}
         </tbody>
-      </table>` : `<div class="empty">—</div>`}
+      </table>
+      ${counterGlossary.length ? `
+      <details class="methodology" style="margin-top:12px;">
+        <summary>What each of these means</summary>
+        ${counterGlossary.map((g) => `<p><b>${escapeHtml(g.label)}</b> <code class="rawname">${escapeHtml(g.key)}</code><br>${escapeHtml(g.help)}</p>`).join('')}
+      </details>` : ''}` : `<div class="empty">—</div>`}
     </section>
 
     <section>
       <h2>Concurrent-user estimate, by window</h2>
       <p class="caption">Est. concurrency = Arrival rate &times; Avg. session length (Little's Law) &mdash; an approximation,
         not a direct count. Error rate = Failed &divide; (Completed + Failed) for that window specifically, not a running
-        total. Avg. latency is a separate measurement (not part of that calculation) — the mean time from sending a chat
-        message to getting a reply, for messages that finished in that window. Windows use their own local numbers, not
-        the run's overall average — see the FAQ below for why.</p>
+        total. The latency columns are separate measurements (not part of that calculation): <b>TTFT</b> is how long until
+        the reply <i>starts</i> arriving, <b>Avg./p95/p99 latency</b> are the full send&rarr;reply round trip — typical,
+        and the slowest 5% and 1%. Windows use their own local numbers, not the run's overall average — see the FAQ below
+        for why.</p>
       <details class="methodology">
         <summary>Full methodology</summary>
         <p>Artillery reports connections/sec per 10s window, not concurrent users. This estimates concurrency with Little's Law
@@ -683,10 +959,22 @@ function generateHtml(result, meta) {
         wait, disconnect), while latency is just the chat round-trip itself (send message &rarr; bot reply), so latency
         is normally shorter than session length and the two shouldn't be expected to match. It's not used anywhere in
         the Est. concurrency calculation above — it's shown here purely as a per-window view of response speed under load.</p>
+        <p><b>TTFT (time to first token)</b> is measured separately from total latency because the backend streams its
+        reply one token at a time (<code>bot_token</code>), so the reply starts appearing long before it's finished.
+        TTFT is the wait before <i>anything</i> comes back — the part a user experiences as "is this thing even working?" —
+        while total latency also includes however long the rest of the reply took to generate. They degrade for different
+        reasons: TTFT climbing usually means requests are queueing before the model starts on them, whereas a steady TTFT
+        with rising total latency means generation itself slowed down (longer replies, or contention during generation).
+        A single send&rarr;reply timer collapses both into one number and can't tell you which is happening.</p>
+        <p><b>p95 and p99</b> are shown next to the mean because LLM latency has a heavy tail: the slowest 1% routinely
+        lands several times the median, and the mean hides it entirely. If p99 is climbing while the mean stays flat, a
+        small slice of users is already having a bad time before any average would show it — which is usually the earliest
+        warning available that capacity is running out. These are that window's own percentiles, not the run's.</p>
       </details>
       ${findings.allWindows.length ? `
-      <table style="margin-top:12px;">
-        <thead><tr><th>t (s)</th><th>Created</th><th>Completed</th><th>Failed</th><th>Arrival rate /s</th><th>Avg. session length</th><th>Est. concurrency</th><th>Avg. latency</th><th>Error rate</th></tr></thead>
+      <div class="table-scroll" style="margin-top:12px;">
+      <table>
+        <thead><tr><th>t (s)</th><th>Created</th><th>Completed</th><th>Failed</th><th>Arrival rate /s</th><th>Avg. session length</th><th>Est. concurrency</th><th>Avg. TTFT</th><th>Avg. latency</th><th>p95 latency</th><th>p99 latency</th><th>Error rate</th></tr></thead>
         <tbody>
           ${findings.allWindows.map((w) => `<tr>
             <td>${fmt(w.t, 0)}</td>
@@ -696,11 +984,15 @@ function generateHtml(result, meta) {
             <td>${fmt(w.arrivalRate, 1)}</td>
             <td>${preciseSeconds(w.sessionMeanMs)}</td>
             <td>${w.concurrency != null ? fmt(w.concurrency, 0) : '—'}</td>
+            <td>${friendlyDuration(w.ttftMeanMs)}</td>
             <td>${friendlyDuration(w.latencyMeanMs)}</td>
+            <td>${friendlyDuration(w.latencyP95Ms)}</td>
+            <td>${friendlyDuration(w.latencyP99Ms)}</td>
             <td class="${w.errorRatePct > 5 ? 'bad' : ''}">${fmt(w.errorRatePct, 1)}%</td>
           </tr>`).join('')}
         </tbody>
-      </table>` : `<div class="empty">No time-series data was recorded for this run.</div>`}
+      </table>
+      </div>` : `<div class="empty">No time-series data was recorded for this run.</div>`}
     </section>
 
     ${phaseBreakdown ? `
@@ -715,8 +1007,8 @@ function generateHtml(result, meta) {
           ${phaseBreakdown.rows.map((r) => `<tr>
             <td>${escapeHtml(r.name)}${r.misaligned ? ' *' : ''}</td>
             <td>${fmt(r.start, 0)}&ndash;${fmt(r.end, 0)}s</td>
-            <td>${r.r0 === r.r1 ? `${fmt(r.r0, 0)}/sec` : `${fmt(r.r0, 0)}&rarr;${fmt(r.r1, 0)}/sec`}</td>
-            <td>${fmt(r.expected, 0)}</td>
+            <td>${r.isPause ? '<span style="color:var(--text-muted)">idle</span>' : (r.r0 === r.r1 ? `${fmt(r.r0, 0)}/sec` : `${fmt(r.r0, 0)}&rarr;${fmt(r.r1, 0)}/sec`)}</td>
+            <td>${r.isPause ? '&mdash;' : fmt(r.expected, 0)}</td>
             <td>${fmt(r.actual, 0)}</td>
           </tr>`).join('')}
         </tbody>

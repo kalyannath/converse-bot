@@ -1,23 +1,33 @@
 config:
-  # Hits the LIVE Render deployment directly over Socket.IO (bypassing Vercel
-  # entirely, same rationale as socket-flow.yml — this finds the backend's
-  # own ceiling, not "how many Chromium tabs fit on my laptop").
+  # Hits the LIVE Render deployment directly over Socket.IO, bypassing the
+  # browser and Vercel entirely — this finds the backend's own ceiling, not
+  # "how many Chromium tabs fit on my laptop".
+  #
+  # The AI is MOCKED here (hence the name): with LOAD_TEST=true the backend
+  # streams a fixed canned reply instead of calling OpenAI, so this measures
+  # the server's own connection and transport capacity with the model's
+  # latency and cost taken out of the picture. Pair it with
+  # ceiling-ai-without-mock.yml, which runs the same ramp with the real model
+  # in the loop; the gap between the two reports is the model's contribution.
   #
   # REQUIRES LOAD_TEST=true set on Render for the duration of this run.
-  # Without it, every VU triggers a real gpt-4o-mini call: the exact-match
-  # `response.data` below (see socket-flow.yml's comment for why it must be
-  # an exact match, not `match`/JSONPath) will never match real generated
-  # text, so every request will silently eat the full response timeout
-  # instead of reporting its real latency, AND you'll pay OpenAI for load-test
-  # traffic. Flip it back to unset/false on Render when this run is done —
-  # see deployed-realistic.yml for the real-OpenAI leg of this test.
+  # Without it, every VU triggers a real gpt-4o-mini call, and the exact-match
+  # `response.data` below will never match real generated text — Artillery's
+  # emit/response sugar needs a literal match (see scripts/realistic-processor.js
+  # for the full explanation), so every request would silently eat the full
+  # response timeout instead of reporting its real latency, AND you'd pay
+  # OpenAI for it. A run that comes back ~100% failures is almost always this
+  # flag being unset. Flip it back to unset/false on Render when done.
   #
   # Render's free tier is a single instance on 0.1 CPU / 512MB with no
-  # autoscaling, so phases below stage more gradually than socket-flow.yml's
-  # local run (which only started bending around arrivalRate 100) — the goal
-  # here is to pinpoint where it bends, not just confirm it eventually does.
-  # Capped at 200/sec by agreement (see report for the reasoning) rather than
-  # the 500 used locally.
+  # autoscaling, so phases below stage gradually — the goal is to pinpoint
+  # where it bends, not just confirm it eventually does. Capped at 200/sec by
+  # agreement (see report for the reasoning).
+  #
+  # Note: phases here are 15-20s, which do NOT line up with Artillery's fixed
+  # 10s reporting window, so the report's phase table will carry the "*"
+  # misalignment caveat on some rows. ceiling-ai-without-mock.yml uses 10s
+  # phases and avoids that.
   target: "https://conversebot-backend.onrender.com"
   socketio:
     transports: ["websocket"]
