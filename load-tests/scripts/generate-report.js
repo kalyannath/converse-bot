@@ -40,19 +40,73 @@ function sumErrorCounters(counters) {
     .reduce((acc, [, v]) => acc + v, 0);
 }
 
-function buildSparklinePath(values, width, height, padding = 4) {
-  if (values.length === 0) return { path: '', points: [] };
-  const max = Math.max(...values, 1);
-  const min = Math.min(...values, 0);
-  const range = max - min || 1;
-  const step = values.length > 1 ? (width - padding * 2) / (values.length - 1) : 0;
-  const points = values.map((v, i) => ({
-    x: padding + i * step,
-    y: height - padding - ((v - min) / range) * (height - padding * 2),
-    v,
-  }));
-  const path = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(' ');
-  return { path, points, max, min };
+// Rounds up to a "nice" axis ceiling (1/2/5 x a power of ten) so gridline
+// labels read as 40/80/120 rather than 37/74/111.
+function niceMax(v) {
+  if (!(v > 0)) return 1;
+  const magnitude = 10 ** Math.floor(Math.log10(v));
+  const norm = v / magnitude;
+  const niceNorm = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10;
+  return niceNorm * magnitude;
+}
+
+// Renders one or more time-series lines (all sharing a left y-axis scaled to
+// their combined max) plus an optional error bar layer (scaled to ITS OWN
+// max instead — error counts/rates and e.g. latency live on completely
+// different scales, so sharing one axis would flatten one of them to
+// nothing). x-axis ticks use each point's own `t` (seconds into the run).
+function renderTimeSeriesChart({ width = 760, height = 200, points, lines, bars, yFormat = (v) => fmt(v, 0) }) {
+  const marginLeft = 44;
+  const marginRight = 8;
+  const marginTop = 10;
+  const marginBottom = 22;
+  const plotW = width - marginLeft - marginRight;
+  const plotH = height - marginTop - marginBottom;
+  const n = points.length;
+  if (n === 0) return '';
+
+  const xStep = n > 1 ? plotW / (n - 1) : 0;
+  const xAt = (i) => marginLeft + i * xStep;
+
+  const yMax = niceMax(Math.max(...lines.flatMap((l) => l.values), 0));
+  const yAt = (v) => marginTop + plotH - (v / yMax) * plotH;
+
+  const gridLines = [0, 0.25, 0.5, 0.75, 1].map((f) => {
+    const val = f * yMax;
+    const y = yAt(val);
+    return `<line x1="${marginLeft}" y1="${y.toFixed(2)}" x2="${(width - marginRight).toFixed(2)}" y2="${y.toFixed(2)}" stroke="var(--border)" stroke-width="1" />`
+      + `<text x="${(marginLeft - 6).toFixed(2)}" y="${(y + 3).toFixed(2)}" text-anchor="end" font-size="9" fill="var(--text-muted)">${escapeHtml(yFormat(val))}</text>`;
+  }).join('');
+
+  const tickCount = Math.min(n, 6);
+  const tickIndices = [...new Set(Array.from({ length: tickCount }, (_, k) =>
+    Math.round((k * (n - 1)) / Math.max(tickCount - 1, 1))))];
+  const xLabels = tickIndices.map((i) =>
+    `<text x="${xAt(i).toFixed(2)}" y="${(height - 4).toFixed(2)}" text-anchor="middle" font-size="9" fill="var(--text-muted)">${escapeHtml(fmt(points[i].t, 0))}s</text>`
+  ).join('');
+
+  let barsMarkup = '';
+  if (bars) {
+    const barMax = Math.max(...bars.values, 1);
+    const barW = plotW / n;
+    barsMarkup = bars.values.map((v, i) => {
+      if (!v) return '';
+      const h = (v / barMax) * plotH;
+      const x = marginLeft + i * barW;
+      const y = marginTop + plotH - h;
+      const title = bars.title ? `<title>${escapeHtml(bars.title(i))}</title>` : '';
+      return `<rect class="err-bar" x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${Math.max(barW - 1, 1).toFixed(2)}" height="${h.toFixed(2)}">${title}</rect>`;
+    }).join('');
+  }
+
+  const linesMarkup = lines.map((l) => {
+    const path = l.values.map((v, i) => `${i === 0 ? 'M' : 'L'}${xAt(i).toFixed(2)},${yAt(v).toFixed(2)}`).join(' ');
+    return `<path d="${path}" fill="none" stroke="${l.color}" stroke-width="${l.widthPx ?? 2}" />`;
+  }).join('');
+
+  const axisLine = `<line x1="${marginLeft}" y1="${(marginTop + plotH).toFixed(2)}" x2="${(width - marginRight).toFixed(2)}" y2="${(marginTop + plotH).toFixed(2)}" stroke="var(--border)" stroke-width="1" />`;
+
+  return `${gridLines}${axisLine}${barsMarkup}${linesMarkup}${xLabels}`;
 }
 
 // Artillery's per-window `intermediate` snapshots report connections/sec
@@ -72,16 +126,29 @@ function computeWindows(result) {
     const prevPeriod = i > 0 ? Number(intermediate[i - 1].period) : null;
     const durationSec = prevPeriod !== null ? (period - prevPeriod) / 1000 : 10;
     const created = snap.counters?.['vusers.created'] ?? 0;
+    const completed = snap.counters?.['vusers.completed'] ?? 0;
     const failed = snap.counters?.['vusers.failed'] ?? 0;
     const sessionMeanMs = snap.summaries?.['vusers.session_length']?.mean ?? globalSessionMeanMs ?? null;
     const arrivalRate = durationSec > 0 ? created / durationSec : 0;
     const concurrency = sessionMeanMs != null ? arrivalRate * (sessionMeanMs / 1000) : null;
-    const errorRatePct = created > 0 ? (failed / created) * 100 : 0;
+    // `created` counts arrivals to THIS window; `completed`/`failed` count
+    // resolutions that landed in THIS window, which can easily be a
+    // different set of VUs once sessions start taking longer than one
+    // window to finish (a VU that arrived 3 windows ago can time out now).
+    // failed/created then stops meaning anything once that happens (it can
+    // exceed 100%). failed/(completed+failed) stays a real 0-100% because
+    // both sides are counted on the same clock: "of the VUs that finished
+    // in this window, what fraction of them failed".
+    const resolved = completed + failed;
+    const errorRatePct = resolved > 0 ? (failed / resolved) * 100 : 0;
     return {
       t: (period - firstPeriod) / 1000,
       created,
+      completed,
       failed,
+      resolved,
       arrivalRate,
+      sessionMeanMs,
       concurrency,
       errorRatePct,
     };
@@ -99,7 +166,7 @@ function computeFindings(result) {
   const MIN_SAMPLE = 5;
 
   const allWindows = computeWindows(result);
-  const usable = allWindows.filter((w) => w.created >= MIN_SAMPLE && w.concurrency != null);
+  const usable = allWindows.filter((w) => w.resolved >= MIN_SAMPLE && w.concurrency != null);
 
   let comfortable = null;
   let breaking = null;
@@ -109,7 +176,9 @@ function computeFindings(result) {
       break;
     }
     if (w.errorRatePct <= COMFORTABLE_MAX_ERR_PCT) {
-      comfortable = w;
+      if (comfortable === null || w.concurrency > comfortable.concurrency) {
+        comfortable = w;
+      }
     }
   }
   // Once things start breaking, queued/backlogged requests finish (or
@@ -197,33 +266,29 @@ function generateHtml(result, meta) {
 
   const chartW = 760;
   const chartH = 200;
-  const p95Line = buildSparklinePath(timeline.map((p) => p.p95 ?? 0), chartW, chartH);
-  const medianLine = buildSparklinePath(timeline.map((p) => p.median ?? 0), chartW, chartH);
-  const maxErrBar = Math.max(...timeline.map((p) => p.errs), 1);
-  const barW = timeline.length ? (chartW - 8) / timeline.length : 0;
-
-  const p95Path = p95Line.path;
-  const medianPath = medianLine.path;
-
-  const errorBars = timeline.map((p, i) => {
-    if (!p.errs) return '';
-    const h = (p.errs / maxErrBar) * (chartH - 8);
-    const x = 4 + i * barW;
-    return `<rect class="err-bar" x="${x.toFixed(2)}" y="${(chartH - h).toFixed(2)}" width="${Math.max(barW - 1, 1).toFixed(2)}" height="${h.toFixed(2)}"><title>${fmt(p.t, 0)}s: ${p.errs} error(s)</title></rect>`;
-  }).join('');
+  const latencyChart = timeline.length ? renderTimeSeriesChart({
+    width: chartW,
+    height: chartH,
+    points: timeline,
+    lines: [
+      { values: timeline.map((p) => p.median ?? 0), color: 'var(--text-muted)', widthPx: 1.5 },
+      { values: timeline.map((p) => p.p95 ?? 0), color: 'var(--accent)', widthPx: 2 },
+    ],
+    bars: { values: timeline.map((p) => p.errs), title: (i) => `${fmt(timeline[i].t, 0)}s: ${timeline[i].errs} error(s)` },
+    yFormat: (v) => friendlyDuration(v),
+  }) : '';
 
   // --- Overview tab data ---
   const findings = computeFindings(result);
   const narrative = buildNarrative(findings, { created, failRate });
-  const concLine = buildSparklinePath(findings.allWindows.map((w) => w.concurrency ?? 0), chartW, chartH);
-  const maxErrPct = Math.max(...findings.allWindows.map((w) => w.errorRatePct), 1);
-  const concBarW = findings.allWindows.length ? (chartW - 8) / findings.allWindows.length : 0;
-  const concErrorBars = findings.allWindows.map((w, i) => {
-    if (!w.errorRatePct) return '';
-    const h = (w.errorRatePct / maxErrPct) * (chartH - 8);
-    const x = 4 + i * concBarW;
-    return `<rect class="err-bar" x="${x.toFixed(2)}" y="${(chartH - h).toFixed(2)}" width="${Math.max(concBarW - 1, 1).toFixed(2)}" height="${h.toFixed(2)}"><title>${fmt(w.t, 0)}s: ${fmt(w.errorRatePct, 0)}% errors</title></rect>`;
-  }).join('');
+  const concurrencyChart = findings.allWindows.length ? renderTimeSeriesChart({
+    width: chartW,
+    height: chartH,
+    points: findings.allWindows,
+    lines: [{ values: findings.allWindows.map((w) => w.concurrency ?? 0), color: 'var(--accent)', widthPx: 2 }],
+    bars: { values: findings.allWindows.map((w) => w.errorRatePct), title: (i) => `${fmt(findings.allWindows[i].t, 0)}s: ${fmt(findings.allWindows[i].errorRatePct, 0)}% errors` },
+    yFormat: (v) => fmt(v, 0),
+  }) : '';
 
   const typicalReplyMs = summaries[headlineKey]?.median;
 
@@ -376,12 +441,11 @@ function generateHtml(result, meta) {
       ${findings.allWindows.length ? `
       <div class="chart-wrap">
         <div class="legend">
-          <span><span class="swatch" style="background:var(--accent)"></span>estimated concurrent users</span>
-          <span><span class="swatch" style="background:var(--bad);opacity:.55"></span>error rate in that moment</span>
+          <span><span class="swatch" style="background:var(--accent)"></span>estimated concurrent users (left axis)</span>
+          <span><span class="swatch" style="background:var(--bad);opacity:.55"></span>error rate in that moment (own scale, hover for %)</span>
         </div>
         <svg viewBox="0 0 ${chartW} ${chartH}" width="100%" height="${chartH}" preserveAspectRatio="none">
-          ${concErrorBars}
-          <path d="${concLine.path}" fill="none" stroke="var(--accent)" stroke-width="2" />
+          ${concurrencyChart}
         </svg>
       </div>` : `<div class="empty">No time-series data was recorded for this run.</div>`}
     </section>
@@ -413,14 +477,12 @@ function generateHtml(result, meta) {
       ${timeline.length ? `
       <div class="chart-wrap">
         <div class="legend">
-          <span><span class="swatch" style="background:var(--accent)"></span>p95</span>
-          <span><span class="swatch" style="background:var(--text-muted)"></span>median</span>
-          <span><span class="swatch" style="background:var(--bad);opacity:.55"></span>errors / period</span>
+          <span><span class="swatch" style="background:var(--accent)"></span>p95 (left axis)</span>
+          <span><span class="swatch" style="background:var(--text-muted)"></span>median (left axis)</span>
+          <span><span class="swatch" style="background:var(--bad);opacity:.55"></span>errors / period (own scale, hover for count)</span>
         </div>
         <svg viewBox="0 0 ${chartW} ${chartH}" width="100%" height="${chartH}" preserveAspectRatio="none">
-          ${errorBars}
-          <path d="${medianPath}" fill="none" stroke="var(--text-muted)" stroke-width="1.5" />
-          <path d="${p95Path}" fill="none" stroke="var(--accent)" stroke-width="2" />
+          ${latencyChart}
         </svg>
       </div>` : `<div class="empty">No time-series data was recorded for this run.</div>`}
     </section>
@@ -472,18 +534,28 @@ function generateHtml(result, meta) {
       <details class="methodology">
         <summary>Methodology</summary>
         <p>Artillery reports connections/sec per 10s window, not concurrent users. This estimates concurrency with Little's Law
-        (L = &lambda;W): that window's arrival rate &times; that window's own mean session length. Windows use their own local
+        (L = &lambda;W): that window's arrival rate &times; that window's own mean session length (the "Avg. session length"
+        column below — multiply it by "Arrival rate /s" yourself to check "Est. concurrency"). Windows use their own local
         session-length mean rather than the run's global mean, since a global mean gets dragged up by any later slow/broken
-        windows and would overstate concurrency in the healthy windows. Windows with fewer than 5 created VUs are excluded from
-        the comfortable/breaking-point analysis (too few samples to trust an error rate from), but are still listed below.</p>
+        windows and would overstate concurrency in the healthy windows. Windows with fewer than 5 resolved (Completed +
+        Failed) VUs are excluded from the comfortable/breaking-point analysis (too few samples to trust an error rate
+        from), but are still listed below.
+        "Error rate" is "Failed" &divide; ("Completed" + "Failed") &mdash; both counted at the moment a VU finishes,
+        landing in whichever window that happens to fall in. It's deliberately NOT Failed &divide; Created: once sessions
+        start taking longer than one window to resolve, a VU can be created in one window and time out several windows
+        later, so comparing that window's failures against its own arrivals stops meaning anything (and can exceed 100%).</p>
       </details>
       ${findings.allWindows.length ? `
       <table style="margin-top:12px;">
-        <thead><tr><th>t (s)</th><th>Arrival rate /s</th><th>Est. concurrency</th><th>Error rate</th></tr></thead>
+        <thead><tr><th>t (s)</th><th>Created</th><th>Completed</th><th>Failed</th><th>Arrival rate /s</th><th>Avg. session length</th><th>Est. concurrency</th><th>Error rate</th></tr></thead>
         <tbody>
           ${findings.allWindows.map((w) => `<tr>
             <td>${fmt(w.t, 0)}</td>
+            <td>${fmt(w.created, 0)}</td>
+            <td>${fmt(w.completed, 0)}</td>
+            <td>${fmt(w.failed, 0)}</td>
             <td>${fmt(w.arrivalRate, 1)}</td>
+            <td>${friendlyDuration(w.sessionMeanMs)}</td>
             <td>${w.concurrency != null ? fmt(w.concurrency, 0) : '—'}</td>
             <td class="${w.errorRatePct > 5 ? 'bad' : ''}">${fmt(w.errorRatePct, 1)}%</td>
           </tr>`).join('')}

@@ -6,6 +6,7 @@
     "test:socket": "node scripts/run-with-report.js socket-flow.yml",
     "test:soak": "node scripts/run-with-report.js socket-soak.yml",
     "test:deployed-ceiling": "node scripts/run-with-report.js deployed-ceiling.yml",
+    "test:deployed-ceiling-ai": "node scripts/run-with-report.js deployed-ceiling-ai.yml",
     "test:deployed-realistic": "node scripts/run-with-report.js deployed-realistic.yml"
   },
   "devDependencies": {
