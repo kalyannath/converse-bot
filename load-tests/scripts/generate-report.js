@@ -55,10 +55,10 @@ function niceMax(v) {
 // max instead — error counts/rates and e.g. latency live on completely
 // different scales, so sharing one axis would flatten one of them to
 // nothing). x-axis ticks use each point's own `t` (seconds into the run).
-function renderTimeSeriesChart({ width = 760, height = 200, points, lines, bars, yFormat = (v) => fmt(v, 0) }) {
+function renderTimeSeriesChart({ width = 760, height = 200, points, lines, bars, markers, yFormat = (v) => fmt(v, 0) }) {
   const marginLeft = 44;
   const marginRight = 8;
-  const marginTop = 10;
+  const marginTop = markers && markers.length ? 30 : 18;
   const marginBottom = 22;
   const plotW = width - marginLeft - marginRight;
   const plotH = height - marginTop - marginBottom;
@@ -106,7 +106,25 @@ function renderTimeSeriesChart({ width = 760, height = 200, points, lines, bars,
 
   const axisLine = `<line x1="${marginLeft}" y1="${(marginTop + plotH).toFixed(2)}" x2="${(width - marginRight).toFixed(2)}" y2="${(marginTop + plotH).toFixed(2)}" stroke="var(--border)" stroke-width="1" />`;
 
-  return `${gridLines}${axisLine}${barsMarkup}${linesMarkup}${xLabels}`;
+  // Vertical dashed callout marking a specific window (e.g. the breaking
+  // point) directly on the chart, so it doesn't only live in a table row.
+  // Labels stagger onto extra rows when two markers land close enough on
+  // the x-axis to otherwise overlap (e.g. "comfortable" and "breaking
+  // point" often sit only a window or two apart).
+  const MARKER_LABEL_GAP_PX = 70;
+  const MARKER_ROW_HEIGHT = 11;
+  let lastMarkerX = -Infinity;
+  let markerRow = 0;
+  const markersMarkup = [...(markers || [])].sort((a, b) => a.index - b.index).map((m) => {
+    const x = xAt(m.index);
+    markerRow = (x - lastMarkerX < MARKER_LABEL_GAP_PX) ? markerRow + 1 : 0;
+    lastMarkerX = x;
+    const labelY = marginTop - 6 - markerRow * MARKER_ROW_HEIGHT;
+    return `<line x1="${x.toFixed(2)}" y1="${marginTop.toFixed(2)}" x2="${x.toFixed(2)}" y2="${(marginTop + plotH).toFixed(2)}" stroke="${m.color}" stroke-width="1.5" stroke-dasharray="3,3" />`
+      + `<text x="${x.toFixed(2)}" y="${labelY.toFixed(2)}" text-anchor="middle" font-size="9" font-weight="600" fill="${m.color}">${escapeHtml(m.label)}</text>`;
+  }).join('');
+
+  return `${gridLines}${axisLine}${barsMarkup}${linesMarkup}${markersMarkup}${xLabels}`;
 }
 
 // Artillery's per-window `intermediate` snapshots report connections/sec
@@ -193,15 +211,26 @@ function computeFindings(result) {
   return { allWindows, usable, comfortable, breaking, peak, neverBroke: !breaking };
 }
 
+// A plain-English, chronological retelling of the run — written to
+// pre-empt the "wait, how do you know that?" follow-up instead of making
+// the reader reconstruct the story from a table.
 function buildNarrative(findings, overall) {
   const parts = [];
+
+  const rates = findings.allWindows.map((w) => w.arrivalRate).filter((r) => r > 0);
+  if (rates.length > 1) {
+    parts.push(
+      `This test ramped traffic from about ${fmt(Math.min(...rates), 0)} to ${fmt(Math.max(...rates), 0)} messages/sec over ${fmt(overall.durationS, 0)}s.`,
+    );
+  }
+
   if (findings.comfortable) {
     parts.push(
-      `Up to roughly ${fmt(findings.comfortable.concurrency, 0)} people using the app at the same time, everything worked normally with essentially no errors.`,
+      `It handled up to roughly ${fmt(findings.comfortable.concurrency, 0)} people chatting at the same time with essentially no errors.`,
     );
   } else if (findings.peak) {
     parts.push(
-      `Even at the highest load reached in this test (roughly ${fmt(findings.peak.concurrency, 0)} concurrent users), the app kept working with no significant errors.`,
+      `Even at the highest load reached in this test (roughly ${fmt(findings.peak.concurrency, 0)} people at once), it kept working with no significant errors.`,
     );
   } else {
     parts.push('This run didn’t generate enough traffic in any single window to estimate concurrent users reliably.');
@@ -209,14 +238,26 @@ function buildNarrative(findings, overall) {
 
   if (findings.breaking) {
     parts.push(
-      `Past roughly ${fmt(findings.breaking.concurrency, 0)} concurrent users, requests started failing — about ${fmt(findings.breaking.errorRatePct, 0)}% of them in that window — which is the breaking point this test found.`,
+      `Past that — around ${fmt(findings.breaking.concurrency, 0)} people at once — replies started failing (about ${fmt(findings.breaking.errorRatePct, 0)}% in that window), and it got worse quickly as load kept climbing.`,
     );
   } else if (overall.created > 0) {
     parts.push(
-      `This test never pushed the app past its limit — the overall failure rate stayed at ${fmt(overall.failRate, 1)}% across the whole run, so the real breaking point is higher than what was tested here.`,
+      `It never broke in this test — the overall failure rate stayed at ${fmt(overall.failRate, 1)}%, so the real limit is higher than what was tested here.`,
     );
   }
   return parts.join(' ');
+}
+
+// Same numbers the cards show, but worked out step by step so "how did you
+// get that" is answered on the page instead of in a follow-up question.
+function buildConcurrencyExplainer(findings) {
+  const explainOne = (label, w) => w
+    ? `${label}: ${fmt(w.arrivalRate, 1)} messages/sec × ${friendlyDuration(w.sessionMeanMs)} average wait per person &asymp; ${fmt(w.concurrency, 0)} people at once (${fmt(w.errorRatePct, 0)}% errors in that window).`
+    : null;
+  return [
+    explainOne('Comfortable capacity', findings.comfortable),
+    explainOne('Breaking point', findings.breaking),
+  ].filter(Boolean).join(' ');
 }
 
 function extractTarget(scriptPath) {
@@ -280,13 +321,24 @@ function generateHtml(result, meta) {
 
   // --- Overview tab data ---
   const findings = computeFindings(result);
-  const narrative = buildNarrative(findings, { created, failRate });
+  const narrative = buildNarrative(findings, { created, failRate, durationS });
+  const concurrencyExplainer = buildConcurrencyExplainer(findings);
+  const chartMarkers = [];
+  if (findings.comfortable) {
+    const i = findings.allWindows.indexOf(findings.comfortable);
+    if (i >= 0) chartMarkers.push({ index: i, label: 'comfortable', color: 'var(--good)' });
+  }
+  if (findings.breaking) {
+    const i = findings.allWindows.indexOf(findings.breaking);
+    if (i >= 0) chartMarkers.push({ index: i, label: 'breaking point', color: 'var(--bad)' });
+  }
   const concurrencyChart = findings.allWindows.length ? renderTimeSeriesChart({
     width: chartW,
     height: chartH,
     points: findings.allWindows,
     lines: [{ values: findings.allWindows.map((w) => w.concurrency ?? 0), color: 'var(--accent)', widthPx: 2 }],
     bars: { values: findings.allWindows.map((w) => w.errorRatePct), title: (i) => `${fmt(findings.allWindows[i].t, 0)}s: ${fmt(findings.allWindows[i].errorRatePct, 0)}% errors` },
+    markers: chartMarkers,
     yFormat: (v) => fmt(v, 0),
   }) : '';
 
@@ -409,6 +461,10 @@ function generateHtml(result, meta) {
   details.methodology { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; font-size: 0.85rem; color: var(--text-muted); }
   details.methodology summary { cursor: pointer; color: var(--text); font-weight: 600; }
   details.methodology p { margin: 10px 0 0; }
+  .explainer { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; font-size: 0.85rem; color: var(--text-muted); margin: -12px 0 28px; }
+  .explainer b { color: var(--text); }
+  .caption { font-size: 0.85rem; color: var(--text-muted); margin: -6px 0 12px; }
+  .faq { display: flex; flex-direction: column; gap: 8px; }
   footer { color: var(--text-muted); font-size: 0.78rem; margin-top: 40px; }
 </style>
 </head>
@@ -436,12 +492,14 @@ function generateHtml(result, meta) {
       <div class="card"><div class="label">Typical reply time</div><div class="value small">${friendlyDuration(typicalReplyMs)}</div></div>
     </div>
 
+    ${concurrencyExplainer ? `<div class="explainer"><b>How the two numbers above are worked out:</b> ${concurrencyExplainer} "People at once" is an estimate (arrival rate &times; average wait), not a direct headcount — Artillery only measures messages/sec directly.</div>` : ''}
+
     <section>
       <h2>Load vs. errors over the test</h2>
       ${findings.allWindows.length ? `
       <div class="chart-wrap">
         <div class="legend">
-          <span><span class="swatch" style="background:var(--accent)"></span>estimated concurrent users (left axis)</span>
+          <span><span class="swatch" style="background:var(--accent)"></span>estimated people at once (left axis)</span>
           <span><span class="swatch" style="background:var(--bad);opacity:.55"></span>error rate in that moment (own scale, hover for %)</span>
         </div>
         <svg viewBox="0 0 ${chartW} ${chartH}" width="100%" height="${chartH}" preserveAspectRatio="none">
@@ -489,6 +547,7 @@ function generateHtml(result, meta) {
 
     <section>
       <h2>Response time / duration metrics</h2>
+      <p class="caption">Aggregated across the whole run, not broken down by window — see "Concurrent-user estimate, by window" below for the time-sliced view.</p>
       ${summaryRows.length ? `
       <table>
         <thead><tr><th>Metric</th><th>Count</th><th>Min</th><th>Median</th><th>Mean</th><th>p95</th><th>p99</th><th>Max</th></tr></thead>
@@ -509,6 +568,7 @@ function generateHtml(result, meta) {
 
     <section>
       <h2>Errors</h2>
+      <p class="caption">Entries starting with "Error:" come from the connection/transport layer itself (Artillery's engine); anything shaped differently is likely a counter the test script defined — see the FAQ below.</p>
       ${errorEntries.length ? `
       <table>
         <thead><tr><th>Error</th><th>Count</th></tr></thead>
@@ -531,8 +591,11 @@ function generateHtml(result, meta) {
 
     <section>
       <h2>Concurrent-user estimate, by window</h2>
+      <p class="caption">Est. concurrency = Arrival rate &times; Avg. session length (Little's Law) &mdash; an approximation,
+        not a direct count. Error rate = Failed &divide; (Completed + Failed) for that window specifically, not a running
+        total. Windows use their own local numbers, not the run's overall average — see the FAQ below for why.</p>
       <details class="methodology">
-        <summary>Methodology</summary>
+        <summary>Full methodology</summary>
         <p>Artillery reports connections/sec per 10s window, not concurrent users. This estimates concurrency with Little's Law
         (L = &lambda;W): that window's arrival rate &times; that window's own mean session length (the "Avg. session length"
         column below — multiply it by "Arrival rate /s" yourself to check "Est. concurrency"). Windows use their own local
@@ -561,6 +624,48 @@ function generateHtml(result, meta) {
           </tr>`).join('')}
         </tbody>
       </table>` : `<div class="empty">No time-series data was recorded for this run.</div>`}
+    </section>
+
+    <section>
+      <h2>Questions this report tends to raise</h2>
+      <div class="faq">
+        <details class="methodology">
+          <summary>Why does the time column jump in fixed 10-second steps, even though the test's phases last 15s or 20s?</summary>
+          <p>Phase <code>duration</code> in the config controls how long traffic is generated at a given rate — that's about
+          traffic shape, not reporting. Artillery takes a metrics snapshot every 10 seconds for the whole run regardless of
+          phase length, so a single phase can span multiple windows, and a window can straddle two phases.</p>
+        </details>
+        <details class="methodology">
+          <summary>What's the difference between Created, Completed, Failed, and Resolved?</summary>
+          <p><b>Created</b> counts new sessions that started in that window. <b>Completed</b> and <b>Failed</b> count
+          sessions that finished in that window — often a different group of people than "Created," since a session can
+          take longer than one window to finish. <b>Resolved</b> is just Completed + Failed: everyone who finished, one
+          way or another, in that window.</p>
+        </details>
+        <details class="methodology">
+          <summary>Why do numbers look strange right around the breaking point?</summary>
+          <p>Latency climbs quietly before failures start — reply times can double or triple with 0% errors, because
+          everyone's still eventually getting an answer, just slower. By the time the error rate actually crosses the
+          threshold, the system is usually already one step from collapse, so numbers right at that boundary tend to look
+          erratic for a window or two either side of it.</p>
+        </details>
+        <details class="methodology">
+          <summary>I see more than one kind of "timeout" or error — are they the same thing?</summary>
+          <p>No. Entries under "Errors" that start with "Error:" come from the connection/transport layer itself
+          (Artillery's engine — e.g. the WebSocket handshake failing or dropping), and they happen before the test
+          script's own logic ever runs. A differently-named counter under "Other counters" means the test script's own
+          code detected something — e.g. a connection succeeded and a message was sent, but no reply came back in time.
+          They fail at different points in the request's life, so it's worth reading them separately rather than adding
+          them together.</p>
+        </details>
+        <details class="methodology">
+          <summary>Is "concurrent users" something Artillery actually measured?</summary>
+          <p>No — Artillery only reports connections/sec per window. "Concurrent users" is a standard estimate
+          (Little's Law): arrival rate &times; how long each person stuck around, per window. It's a good
+          approximation, not a direct headcount, which is why it's always shown as "~" (roughly) rather than an exact
+          figure.</p>
+        </details>
+      </div>
     </section>
   </section>
 
