@@ -16,6 +16,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const yaml = require('js-yaml');
 
 function escapeHtml(str) {
   return String(str).replace(/[&<>"']/g, (c) => ({
@@ -32,6 +33,16 @@ function friendlyDuration(ms) {
   if (ms === undefined || ms === null || Number.isNaN(ms)) return 'n/a';
   if (ms < 1000) return `${fmt(ms, 0)} ms`;
   return `${fmt(ms / 1000, 1)}s`;
+}
+
+// Same idea as friendlyDuration, but keeps 2 decimal places of precision
+// (instead of 1) wherever a reader might multiply this by "Arrival rate /s"
+// to check "Est. concurrency" by hand — 1 decimal loses enough precision
+// that the manual check can round to a different whole number than the
+// column actually shown.
+function preciseSeconds(ms) {
+  if (ms === undefined || ms === null || Number.isNaN(ms)) return 'n/a';
+  return `${fmt(ms / 1000, 2)}s`;
 }
 
 function sumErrorCounters(counters) {
@@ -252,7 +263,7 @@ function buildNarrative(findings, overall) {
 // get that" is answered on the page instead of in a follow-up question.
 function buildConcurrencyExplainer(findings) {
   const explainOne = (label, w) => w
-    ? `${label}: ${fmt(w.arrivalRate, 1)} messages/sec × ${friendlyDuration(w.sessionMeanMs)} average wait per person &asymp; ${fmt(w.concurrency, 0)} people at once (${fmt(w.errorRatePct, 0)}% errors in that window).`
+    ? `${label}: ${fmt(w.arrivalRate, 1)} messages/sec × ${preciseSeconds(w.sessionMeanMs)} average wait per person &asymp; ${fmt(w.concurrency, 0)} people at once (${fmt(w.errorRatePct, 0)}% errors in that window).`
     : null;
   return [
     explainOne('Comfortable capacity', findings.comfortable),
@@ -266,6 +277,48 @@ function extractTarget(scriptPath) {
   const text = fs.readFileSync(scriptPath, 'utf8');
   const match = text.match(/target[:=]\s*['"]([^'"]+)['"]/);
   return match ? match[1] : undefined;
+}
+
+// Only .yml/.yaml configs have a parseable `phases:` list (the .ts flow
+// scripts define load differently) — returns null rather than throwing so
+// the phase-breakdown section can just be skipped for those.
+function extractPhases(scriptPath) {
+  if (!scriptPath || !fs.existsSync(scriptPath) || !/\.ya?ml$/i.test(scriptPath)) return null;
+  try {
+    const doc = yaml.safeLoad(fs.readFileSync(scriptPath, 'utf8'));
+    const phases = doc?.config?.phases;
+    return Array.isArray(phases) && phases.length ? phases : null;
+  } catch {
+    return null;
+  }
+}
+
+// Compares what the config asked for (arrival rate × duration, or the
+// average rate × duration for a ramp) against what actually landed in the
+// run's 10s reporting windows for that phase's time range. The two will
+// never match exactly: Artillery's arrival process is randomized around
+// the target rate rather than a rigid metronome, and — per the FAQ below —
+// phase boundaries don't always land on the fixed 10s window grid, so a
+// window that straddles two phases gets attributed entirely to whichever
+// phase was running when the window started.
+function computePhaseBreakdown(phases, allWindows) {
+  if (!phases || !phases.length || !allWindows.length) return null;
+  let cursor = 0;
+  const rows = phases.map((p) => {
+    const dur = Number(p.duration) || 0;
+    const r0 = Number(p.arrivalRate ?? p.rampTo ?? 0);
+    const r1 = Number(p.rampTo ?? p.arrivalRate ?? r0);
+    const start = cursor;
+    const end = cursor + dur;
+    cursor = end;
+    const expected = ((r0 + r1) / 2) * dur;
+    const actual = allWindows.filter((w) => w.t >= start && w.t < end).reduce((s, w) => s + w.created, 0);
+    const misaligned = start % 10 !== 0 || end % 10 !== 0;
+    return { name: p.name || '(unnamed phase)', start, end, dur, r0, r1, expected, actual, misaligned };
+  });
+  const totalCreated = allWindows.reduce((s, w) => s + w.created, 0);
+  const accountedFor = rows.reduce((s, r) => s + r.actual, 0);
+  return { rows, totalCreated, stragglers: totalCreated - accountedFor };
 }
 
 function generateHtml(result, meta) {
@@ -323,6 +376,7 @@ function generateHtml(result, meta) {
   const findings = computeFindings(result);
   const narrative = buildNarrative(findings, { created, failRate, durationS });
   const concurrencyExplainer = buildConcurrencyExplainer(findings);
+  const phaseBreakdown = computePhaseBreakdown(meta.phases, findings.allWindows);
   const chartMarkers = [];
   if (findings.comfortable) {
     const i = findings.allWindows.indexOf(findings.comfortable);
@@ -598,9 +652,12 @@ function generateHtml(result, meta) {
         <summary>Full methodology</summary>
         <p>Artillery reports connections/sec per 10s window, not concurrent users. This estimates concurrency with Little's Law
         (L = &lambda;W): that window's arrival rate &times; that window's own mean session length (the "Avg. session length"
-        column below — multiply it by "Arrival rate /s" yourself to check "Est. concurrency"). Windows use their own local
-        session-length mean rather than the run's global mean, since a global mean gets dragged up by any later slow/broken
-        windows and would overstate concurrency in the healthy windows. Windows with fewer than 5 resolved (Completed +
+        column below — multiply it by "Arrival rate /s" yourself to check "Est. concurrency"; "Arrival rate /s" is always
+        exact since every window is exactly 10s and "Created" is a whole number, and "Avg. session length" is shown to 2
+        decimal places specifically so this check reproduces the displayed "Est. concurrency", rounded to the nearest whole
+        person). Windows use their own local session-length mean rather than the run's global mean, since a global mean
+        gets dragged up by any later slow/broken windows and would overstate concurrency in the healthy windows. Windows
+        with fewer than 5 resolved (Completed +
         Failed) VUs are excluded from the comfortable/breaking-point analysis (too few samples to trust an error rate
         from), but are still listed below.
         "Error rate" is "Failed" &divide; ("Completed" + "Failed") &mdash; both counted at the moment a VU finishes,
@@ -618,13 +675,47 @@ function generateHtml(result, meta) {
             <td>${fmt(w.completed, 0)}</td>
             <td>${fmt(w.failed, 0)}</td>
             <td>${fmt(w.arrivalRate, 1)}</td>
-            <td>${friendlyDuration(w.sessionMeanMs)}</td>
+            <td>${preciseSeconds(w.sessionMeanMs)}</td>
             <td>${w.concurrency != null ? fmt(w.concurrency, 0) : '—'}</td>
             <td class="${w.errorRatePct > 5 ? 'bad' : ''}">${fmt(w.errorRatePct, 1)}%</td>
           </tr>`).join('')}
         </tbody>
       </table>` : `<div class="empty">No time-series data was recorded for this run.</div>`}
     </section>
+
+    ${phaseBreakdown ? `
+    <section>
+      <h2>Traffic ramp: expected vs. actual, by phase</h2>
+      <p class="caption">"Expected" is arrival rate &times; duration straight from ${escapeHtml(meta.scriptName || 'the config')}
+        (average rate &times; duration for a ramp). "Actual" sums the run's own 10s windows that fall in that phase's time
+        range. They're never exact matches — see why below the table.</p>
+      <table>
+        <thead><tr><th>Phase</th><th>Time range</th><th>Target rate</th><th>Expected created</th><th>Actual created</th></tr></thead>
+        <tbody>
+          ${phaseBreakdown.rows.map((r) => `<tr>
+            <td>${escapeHtml(r.name)}${r.misaligned ? ' *' : ''}</td>
+            <td>${fmt(r.start, 0)}&ndash;${fmt(r.end, 0)}s</td>
+            <td>${r.r0 === r.r1 ? `${fmt(r.r0, 0)}/sec` : `${fmt(r.r0, 0)}&rarr;${fmt(r.r1, 0)}/sec`}</td>
+            <td>${fmt(r.expected, 0)}</td>
+            <td>${fmt(r.actual, 0)}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+      <p class="caption" style="margin-top:12px;">
+        ${phaseBreakdown.rows.some((r) => r.misaligned) ? '* this phase\'s start or end time falls mid-window, so its "actual" figure blends with the neighboring phase — treat marked rows as a group rather than individually. ' : ''}
+        ${phaseBreakdown.stragglers > 0 ? `${fmt(phaseBreakdown.stragglers, 0)} more VUs were created a few seconds after the last phase's nominal end (${fmt(phaseBreakdown.rows[phaseBreakdown.rows.length - 1]?.end, 0)}s) and aren't attributed to any phase above — Artillery's arrival scheduling doesn't cut off with perfect precision at a phase boundary.` : ''}
+      </p>
+      <details class="methodology">
+        <summary>Why expected and actual never match exactly</summary>
+        <p>Two separate effects, both normal: (1) Artillery's arrival process is randomized around the target rate rather
+        than a rigid metronome — asking for 15/sec doesn't mean exactly 15 arrive in every single second, just that 15/sec
+        is the average. (2) Phase boundaries are set by cumulative <code>duration</code> values, which don't always land on
+        the fixed 10-second window grid this report's windows use — a window that starts in one phase and ends in the next
+        gets counted entirely under whichever phase was running at its start. Neither is a bug in the test or this report;
+        they're just two different ways of measuring "how much traffic happened," one from the config's intent and one
+        from what Artillery actually recorded.</p>
+      </details>
+    </section>` : ''}
 
     <section>
       <h2>Questions this report tends to raise</h2>
@@ -703,6 +794,8 @@ function main() {
     name: path.basename(path.dirname(path.dirname(jsonPath))) || 'Load Test',
     timestamp: new Date().toLocaleString(),
     target: extractTarget(scriptPath),
+    phases: extractPhases(scriptPath),
+    scriptName: scriptPath ? path.basename(scriptPath) : undefined,
     jsonFile: path.basename(jsonPath),
   });
   const dest = outPath || jsonPath.replace(/\.json$/, '.html');

@@ -7,10 +7,14 @@
     "test:soak": "node scripts/run-with-report.js socket-soak.yml",
     "test:deployed-ceiling": "node scripts/run-with-report.js deployed-ceiling.yml",
     "test:deployed-ceiling-ai": "node scripts/run-with-report.js deployed-ceiling-ai.yml",
-    "test:deployed-realistic": "node scripts/run-with-report.js deployed-realistic.yml"
+    "test:deployed-ceiling-ai-10s": "node scripts/run-with-report.js deployed-ceiling-ai-10s.yml",
+    "test:deployed-realistic": "node scripts/run-with-report.js deployed-realistic.yml",
+    "postinstall": "patch-package"
   },
   "devDependencies": {
     "artillery": "^2.0.0",
+    "js-yaml": "^3.13.0",
+    "patch-package": "^8.0.1",
     "playwright": "^1.48.0"
   }
 }

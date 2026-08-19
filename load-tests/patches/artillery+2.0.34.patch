@@ -1,0 +1,33 @@
+diff --git a/node_modules/artillery/dist/lib/core/engine_socketio.js b/node_modules/artillery/dist/lib/core/engine_socketio.js
+index c14e7ab..d29328e 100644
+--- a/node_modules/artillery/dist/lib/core/engine_socketio.js
++++ b/node_modules/artillery/dist/lib/core/engine_socketio.js
+@@ -289,14 +289,25 @@ export default class SocketIoEngine {
+             socket.on('*', () => {
+                 context.__receivedMessageCount++;
+             });
++            // 'connect', 'connect_error', and 'error' can all fire for the
++            // same connection attempt under heavy connection churn (a known
++            // socket.io-client quirk), which double-invokes `cb` and crashes
++            // the whole worker via async's "Callback was already called"
++            // guard. Settle on whichever fires first; ignore the rest.
++            let settled = false;
++            const settle = (err, sock) => {
++                if (settled) return;
++                settled = true;
++                cb(err, sock);
++            };
+             socket.once('connect', () => {
+-                cb(null, socket);
++                settle(null, socket);
+             });
+             socket.once('connect_error', (err) => {
+-                cb(err, null);
++                settle(err, null);
+             });
+             socket.once('error', (err) => {
+-                cb(err, socket);
++                settle(err, socket);
+             });
+         }
+         else {
